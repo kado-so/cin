@@ -138,6 +138,64 @@ func TestSetTemplateAndPreservesUnrelatedEncryptedValue(t *testing.T) {
 	}
 }
 
+func TestGetAppliesLocalOverrideAtHighestPrecedence(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	dir := t.TempDir()
+	chdir(t, dir)
+
+	runOK(t, []string{"init", "vaishnav"})
+	runOK(t, []string{"set", "-e", "dev", "options.postgres.host", "shared"})
+
+	runOK(t, []string{"-f", "configs.local.secret.yaml", "init", "intruder"})
+	runOK(t, []string{"-f", "configs.local.secret.yaml", "set", "-e", "dev", "options.postgres.host", "local"})
+
+	stdout, stderr, code := runCLI([]string{"--user", "vaishnav", "get", "-e", "dev", "options.postgres.host", "--show"})
+	if code != 0 {
+		t.Fatalf("get with default local failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if got := strings.TrimSpace(stdout); got != "options.postgres.host = local" {
+		t.Fatalf("expected default local override, got %q", got)
+	}
+
+	stdout, stderr, code = runCLI([]string{"--no-local", "--user", "vaishnav", "get", "-e", "dev", "options.postgres.host", "--show"})
+	if code != 0 {
+		t.Fatalf("get with --no-local failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if got := strings.TrimSpace(stdout); got != "options.postgres.host = shared" {
+		t.Fatalf("expected shared value with --no-local, got %q", got)
+	}
+
+	runOK(t, []string{"-f", "custom.local.secret.yaml", "init", "other"})
+	runOK(t, []string{"-f", "custom.local.secret.yaml", "set", "-e", "dev", "options.postgres.host", "custom"})
+	stdout, stderr, code = runCLI([]string{"--local-file", "custom.local.secret.yaml", "--user", "vaishnav", "get", "-e", "dev", "options.postgres.host", "--show"})
+	if code != 0 {
+		t.Fatalf("get with --local-file failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if got := strings.TrimSpace(stdout); got != "options.postgres.host = custom" {
+		t.Fatalf("expected chosen local override, got %q", got)
+	}
+}
+
+func TestGetShowRequiresExplicitCurrentUser(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+	t.Setenv("CIN_USER", "")
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "options.postgres.host", "postgres"})
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--no-local", "get", "-e", "dev", "options.postgres.host", "--show"})
+	if code != 2 {
+		t.Fatalf("expected current user error exit, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "current user is required") || !strings.Contains(stderr, "pass --user <username> or set CIN_USER") {
+		t.Fatalf("expected current user guidance, got %q", stderr)
+	}
+}
+
 func testIdentity(t *testing.T) *age.X25519Identity {
 	t.Helper()
 	identity, err := age.GenerateX25519Identity()
@@ -145,6 +203,22 @@ func testIdentity(t *testing.T) *age.X25519Identity {
 		t.Fatalf("generate identity: %v", err)
 	}
 	return identity
+}
+
+func chdir(t *testing.T, dir string) {
+	t.Helper()
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get cwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(cwd); err != nil {
+			t.Fatalf("restore cwd: %v", err)
+		}
+	})
 }
 
 func runOK(t *testing.T, args []string) string {

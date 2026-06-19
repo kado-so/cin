@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestRecipientsSortsUsersAndLooksUpPublicKeys(t *testing.T) {
@@ -111,6 +113,130 @@ func TestSaveMutatedEmptyEnvsUsesBlockStyle(t *testing.T) {
 	}
 }
 
+func TestResolvedEnvMergesStringInheritance(t *testing.T) {
+	doc := loadTestConfig(t, `
+envs:
+  shared:
+    options:
+      postgres:
+        host: ENC[shared-host]
+        port: ENC[shared-port]
+    apps:
+      api:
+        values:
+          DATABASE_URL: ENC[shared-db]
+  dev:
+    extends: shared
+    options:
+      postgres:
+        host: ENC[dev-host]
+    apps:
+      api:
+        values:
+          REDIS_URL: ENC[dev-redis]
+`)
+
+	env := mustResolvedEnv(t, doc, "dev")
+	assertResolvedScalar(t, env, []string{"options", "postgres", "host"}, "ENC[dev-host]")
+	assertResolvedScalar(t, env, []string{"options", "postgres", "port"}, "ENC[shared-port]")
+	assertResolvedScalar(t, env, []string{"apps", "api", "values", "DATABASE_URL"}, "ENC[shared-db]")
+	assertResolvedScalar(t, env, []string{"apps", "api", "values", "REDIS_URL"}, "ENC[dev-redis]")
+}
+
+func TestResolvedEnvMergesListInheritanceWithRightmostParentPrecedence(t *testing.T) {
+	doc := loadTestConfig(t, `
+envs:
+  shared:
+    options:
+      feature:
+        enabled: ENC[shared-enabled]
+      list: [shared]
+    apps:
+      api:
+        values:
+          MODE: ENC[shared-mode]
+  dev:
+    options:
+      feature:
+        level: ENC[dev-level]
+      list: [dev]
+    apps:
+      api:
+        values:
+          MODE: ENC[dev-mode]
+  vaishnav:
+    extends: [shared, dev]
+    options:
+      feature:
+        enabled: ENC[child-enabled]
+`)
+
+	env := mustResolvedEnv(t, doc, "vaishnav")
+	assertResolvedScalar(t, env, []string{"options", "feature", "enabled"}, "ENC[child-enabled]")
+	assertResolvedScalar(t, env, []string{"options", "feature", "level"}, "ENC[dev-level]")
+	assertResolvedScalar(t, env, []string{"apps", "api", "values", "MODE"}, "ENC[dev-mode]")
+
+	list := getMap(getMap(env, "options"), "list")
+	if list == nil || list.Kind != yaml.SequenceNode || len(list.Content) != 1 || list.Content[0].Value != "dev" {
+		t.Fatalf("expected array to be replaced by rightmost parent, got %#v", list)
+	}
+}
+
+func TestMergeEnvAppliesLocalHighestPrecedence(t *testing.T) {
+	shared := loadTestConfig(t, `
+envs:
+  dev:
+    options:
+      postgres:
+        host: ENC[shared-host]
+        port: ENC[shared-port]
+`)
+	local := loadTestConfig(t, `
+cin:
+  users:
+    ignored: {}
+envs:
+  dev:
+    options:
+      postgres:
+        host: ENC[local-host]
+`)
+
+	env := configMergeForTest(t, shared, local, "dev")
+	assertResolvedScalar(t, env, []string{"options", "postgres", "host"}, "ENC[local-host]")
+	assertResolvedScalar(t, env, []string{"options", "postgres", "port"}, "ENC[shared-port]")
+}
+
+func TestResolvedEnvErrorsOnMissingParent(t *testing.T) {
+	doc := loadTestConfig(t, `
+envs:
+  dev:
+    extends: shared
+`)
+
+	_, err := doc.ResolvedEnv("dev")
+	if err == nil || !strings.Contains(err.Error(), "environment parent not found: shared") {
+		t.Fatalf("expected missing parent error, got %v", err)
+	}
+}
+
+func TestResolvedEnvErrorsOnCycle(t *testing.T) {
+	doc := loadTestConfig(t, `
+envs:
+  a:
+    extends: b
+  b:
+    extends: c
+  c:
+    extends: a
+`)
+
+	_, err := doc.ResolvedEnv("a")
+	if err == nil || !strings.Contains(err.Error(), "inheritance cycle detected: a -> b -> c -> a") {
+		t.Fatalf("expected cycle error, got %v", err)
+	}
+}
+
 func loadTestConfig(t *testing.T, yaml string) *Document {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.yaml")
@@ -122,6 +248,33 @@ func loadTestConfig(t *testing.T, yaml string) *Document {
 		t.Fatalf("load fixture: %v", err)
 	}
 	return doc
+}
+
+func mustResolvedEnv(t *testing.T, doc *Document, env string) *yaml.Node {
+	t.Helper()
+	resolved, err := doc.ResolvedEnv(env)
+	if err != nil {
+		t.Fatalf("resolve env: %v", err)
+	}
+	return resolved
+}
+
+func assertResolvedScalar(t *testing.T, env *yaml.Node, path []string, want string) {
+	t.Helper()
+	got, ok := ScalarIn(env, path)
+	if !ok {
+		t.Fatalf("expected scalar at %v", path)
+	}
+	if got != want {
+		t.Fatalf("expected %q at %v, got %q", want, path, got)
+	}
+}
+
+func configMergeForTest(t *testing.T, shared *Document, local *Document, env string) *yaml.Node {
+	t.Helper()
+	sharedEnv := mustResolvedEnv(t, shared, env)
+	localEnv := mustResolvedEnv(t, local, env)
+	return MergeEnv(sharedEnv, localEnv)
 }
 
 func mustRecipientSet(t *testing.T, doc *Document, path []string, env string, override string) string {

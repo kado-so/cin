@@ -14,6 +14,7 @@ import (
 	"cin/internal/envelope"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
+	"gopkg.in/yaml.v3"
 )
 
 const version = "0.0.0-dev"
@@ -33,6 +34,8 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) int {
 func NewRootCommand(stdout io.Writer, stderr io.Writer) *cobra.Command {
 	var showVersion bool
 	var filePath string
+	var localFile string
+	var noLocal bool
 	var user string
 
 	root := &cobra.Command{
@@ -54,6 +57,8 @@ func NewRootCommand(stdout io.Writer, stderr io.Writer) *cobra.Command {
 	root.SetErr(stderr)
 	root.SetIn(os.Stdin)
 	root.PersistentFlags().StringVarP(&filePath, "file", "f", "configs.secret.yaml", "config file")
+	root.PersistentFlags().StringVar(&localFile, "local-file", "", "local override file")
+	root.PersistentFlags().BoolVar(&noLocal, "no-local", false, "disable local override file")
 	root.PersistentFlags().StringVar(&user, "user", "", "current cin user")
 	root.Flags().BoolVarP(&showVersion, "version", "v", false, "show the cin version")
 
@@ -68,7 +73,7 @@ func NewRootCommand(stdout io.Writer, stderr io.Writer) *cobra.Command {
 
 	root.AddCommand(newInitCommand(stdout, &filePath))
 	root.AddCommand(newSetCommand(&filePath))
-	root.AddCommand(newGetCommand(stdout, &filePath, &user))
+	root.AddCommand(newGetCommand(stdout, &filePath, &localFile, &noLocal, &user))
 
 	return root
 }
@@ -187,7 +192,7 @@ func newSetCommand(filePath *string) *cobra.Command {
 	return cmd
 }
 
-func newGetCommand(stdout io.Writer, filePath *string, user *string) *cobra.Command {
+func newGetCommand(stdout io.Writer, filePath *string, localFile *string, noLocal *bool, user *string) *cobra.Command {
 	var env string
 	var app string
 	var show bool
@@ -206,7 +211,11 @@ func newGetCommand(stdout io.Writer, filePath *string, user *string) *cobra.Comm
 			if err != nil {
 				return err
 			}
-			value, ok := doc.GetScalar(path)
+			resolved, err := resolvedEnv(doc, *localFile, *noLocal, env)
+			if err != nil {
+				return err
+			}
+			value, ok := config.ScalarIn(resolved, path[2:])
 			if !ok {
 				return missingValueError(doc, env, app, key)
 			}
@@ -252,6 +261,46 @@ func loadConfig(path string) (*config.Document, error) {
 	}
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("config file not found: %s\nfix: run `cin init <username>` or pass -f <file>", path)
+	}
+	return nil, err
+}
+
+func resolvedEnv(doc *config.Document, localFile string, noLocal bool, env string) (*yaml.Node, error) {
+	resolved, err := doc.ResolvedEnv(env)
+	if err != nil {
+		return nil, err
+	}
+	localDoc, err := loadLocalConfig(localFile, noLocal)
+	if err != nil {
+		return nil, err
+	}
+	if localDoc == nil || !localDoc.HasEnv(env) {
+		return resolved, nil
+	}
+	localResolved, err := localDoc.ResolvedEnv(env)
+	if err != nil {
+		return nil, err
+	}
+	return config.MergeEnv(resolved, localResolved), nil
+}
+
+func loadLocalConfig(path string, disabled bool) (*config.Document, error) {
+	if disabled {
+		return nil, nil
+	}
+	defaultPath := path == ""
+	if defaultPath {
+		path = "configs.local.secret.yaml"
+	}
+	doc, err := config.Load(path)
+	if err == nil {
+		return doc, nil
+	}
+	if errors.Is(err, os.ErrNotExist) && defaultPath {
+		return nil, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("local config file not found: %s", path)
 	}
 	return nil, err
 }

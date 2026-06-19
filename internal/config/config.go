@@ -110,6 +110,27 @@ func (d *Document) GetAppValue(env, app, key string) (string, bool) {
 	return d.GetScalar([]string{"envs", env, "apps", app, "values", key})
 }
 
+func (d *Document) HasEnv(env string) bool {
+	node := d.lookup([]string{"envs", env})
+	return node != nil
+}
+
+func (d *Document) ResolvedEnv(env string) (*yaml.Node, error) {
+	return d.resolveEnv(env, nil)
+}
+
+func MergeEnv(base, overlay *yaml.Node) *yaml.Node {
+	return mergeNodes(base, overlay)
+}
+
+func ScalarIn(node *yaml.Node, path []string) (string, bool) {
+	node = lookupNode(node, path)
+	if node == nil || node.Kind != yaml.ScalarNode {
+		return "", false
+	}
+	return node.Value, true
+}
+
 func (d *Document) SetScalar(path []string, value string) error {
 	parent := d.ensureMap(path[:len(path)-1])
 	setMap(parent, path[len(path)-1], scalar(value))
@@ -227,14 +248,45 @@ func (d *Document) ensureMap(path []string) *yaml.Node {
 }
 
 func (d *Document) lookup(path []string) *yaml.Node {
-	cur := d.root.Content[0]
-	for _, key := range path {
-		if cur == nil || cur.Kind != yaml.MappingNode {
-			return nil
+	return lookupNode(d.root.Content[0], path)
+}
+
+func (d *Document) resolveEnv(env string, stack []string) (*yaml.Node, error) {
+	for i, name := range stack {
+		if name == env {
+			cycle := append(append([]string{}, stack[i:]...), env)
+			return nil, fmt.Errorf("inheritance cycle detected: %s", strings.Join(cycle, " -> "))
 		}
-		cur = getMap(cur, key)
 	}
-	return cur
+
+	envNode := d.lookup([]string{"envs", env})
+	if envNode == nil {
+		if len(stack) > 0 {
+			return nil, fmt.Errorf("environment parent not found: %s", env)
+		}
+		return nil, fmt.Errorf("environment not found: %s", env)
+	}
+	if envNode.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("environment must be a map: %s", env)
+	}
+
+	parents, err := extendsList(envNode)
+	if err != nil {
+		return nil, fmt.Errorf("invalid extends for %s: %w", env, err)
+	}
+
+	resolved := mapNode()
+	for _, parent := range parents {
+		parentNode, err := d.resolveEnv(parent, append(stack, env))
+		if err != nil {
+			return nil, err
+		}
+		resolved = mergeNodes(resolved, parentNode)
+	}
+
+	child := cloneNode(envNode)
+	deleteMap(child, "extends")
+	return mergeNodes(resolved, child), nil
 }
 
 func (d *Document) sort() {
@@ -271,6 +323,78 @@ func normalizeNode(n *yaml.Node) {
 	}
 }
 
+func extendsList(env *yaml.Node) ([]string, error) {
+	node := getMap(env, "extends")
+	if node == nil {
+		return nil, nil
+	}
+	switch node.Kind {
+	case yaml.ScalarNode:
+		if node.Value == "" {
+			return nil, nil
+		}
+		return []string{node.Value}, nil
+	case yaml.SequenceNode:
+		parents := make([]string, 0, len(node.Content))
+		for _, child := range node.Content {
+			if child.Kind != yaml.ScalarNode || child.Value == "" {
+				return nil, errors.New("list entries must be non-empty strings")
+			}
+			parents = append(parents, child.Value)
+		}
+		return parents, nil
+	default:
+		return nil, errors.New("must be a string or list")
+	}
+}
+
+func mergeNodes(base, overlay *yaml.Node) *yaml.Node {
+	if base == nil {
+		return cloneNode(overlay)
+	}
+	if overlay == nil {
+		return cloneNode(base)
+	}
+	if base.Kind != yaml.MappingNode || overlay.Kind != yaml.MappingNode {
+		return cloneNode(overlay)
+	}
+
+	merged := cloneNode(base)
+	for i := 0; i < len(overlay.Content); i += 2 {
+		key := overlay.Content[i].Value
+		left := getMap(merged, key)
+		right := overlay.Content[i+1]
+		if left == nil {
+			setMap(merged, key, cloneNode(right))
+		} else {
+			setMap(merged, key, mergeNodes(left, right))
+		}
+	}
+	return merged
+}
+
+func cloneNode(node *yaml.Node) *yaml.Node {
+	if node == nil {
+		return nil
+	}
+	clone := *node
+	clone.Content = make([]*yaml.Node, len(node.Content))
+	for i, child := range node.Content {
+		clone.Content[i] = cloneNode(child)
+	}
+	return &clone
+}
+
+func lookupNode(cur *yaml.Node, path []string) *yaml.Node {
+	for _, key := range path {
+		if cur == nil || cur.Kind != yaml.MappingNode {
+			return nil
+		}
+		cur = getMap(cur, key)
+	}
+	return cur
+}
+
 func getMap(m *yaml.Node, key string) *yaml.Node {
 	for i := 0; i < len(m.Content); i += 2 {
 		if m.Content[i].Value == key {
@@ -288,6 +412,18 @@ func setMap(m *yaml.Node, key string, value *yaml.Node) {
 		}
 	}
 	m.Content = append(m.Content, scalar(key), value)
+}
+
+func deleteMap(m *yaml.Node, key string) {
+	if m == nil || m.Kind != yaml.MappingNode {
+		return
+	}
+	for i := 0; i < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			m.Content = append(m.Content[:i], m.Content[i+2:]...)
+			return
+		}
+	}
 }
 
 func mapNode(pairs ...[2]*yaml.Node) *yaml.Node {
