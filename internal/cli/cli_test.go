@@ -440,6 +440,99 @@ func TestExplainRedactsResultAndShowsDependencies(t *testing.T) {
 	}
 }
 
+func TestRunInjectsSelectedAppValues(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+	t.Setenv("API_TOKEN", "preexisting")
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "from-cin"})
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "run", "-e", "dev", "-a", "api", "--", "/bin/sh", "-c", "printf %s \"$API_TOKEN\""})
+	if code != 0 {
+		t.Fatalf("run failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "from-cin" {
+		t.Fatalf("expected injected value to override process env, got %q", stdout)
+	}
+}
+
+func TestRunRequiresApp(t *testing.T) {
+	stdout, stderr, code := runCLI([]string{"run", "-e", "dev", "--", "/usr/bin/true"})
+	if code != 2 {
+		t.Fatalf("expected missing app failure, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "cin run requires -a <app>") {
+		t.Fatalf("expected app guidance, got %q", stderr)
+	}
+}
+
+func TestRunRequiresEnv(t *testing.T) {
+	stdout, stderr, code := runCLI([]string{"run", "-a", "api", "--", "/usr/bin/true"})
+	if code != 2 {
+		t.Fatalf("expected missing env failure, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "environment is required") {
+		t.Fatalf("expected env guidance, got %q", stderr)
+	}
+}
+
+func TestRunPreservesChildExitCode(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "from-cin"})
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "run", "-e", "dev", "-a", "api", "--", "/bin/sh", "-c", "exit 7"})
+	if code != 7 {
+		t.Fatalf("expected child exit code 7, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestRunAppliesLocalOverrideAndTemplateResolution(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	dir := t.TempDir()
+	chdir(t, dir)
+
+	runOK(t, []string{"init", "vaishnav"})
+	runOK(t, []string{"set", "-e", "shared", "options.postgres.host", "shared"})
+	runOK(t, []string{"set", "-e", "shared", "-a", "api", "DATABASE_URL", "postgres://{{ .options.postgres.host }}/api"})
+	setExtends(t, "configs.secret.yaml", "dev", "shared")
+
+	runOK(t, []string{"-f", "configs.local.secret.yaml", "init", "local"})
+	runOK(t, []string{"-f", "configs.local.secret.yaml", "set", "-e", "dev", "options.postgres.host", "local"})
+
+	stdout, stderr, code := runCLI([]string{"--user", "vaishnav", "run", "-e", "dev", "-a", "api", "--", "/bin/sh", "-c", "printf %s \"$DATABASE_URL\""})
+	if code != 0 {
+		t.Fatalf("run failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "postgres://local/api" {
+		t.Fatalf("expected resolved template with local override, got %q", stdout)
+	}
+}
+
+func TestRunDoesNotPrintPlaintextFromCin(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "SECRET_TOKEN", "do-not-print"})
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "run", "-e", "dev", "-a", "api", "--", "/usr/bin/true"})
+	if code != 0 {
+		t.Fatalf("run failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if strings.Contains(stdout, "do-not-print") || strings.Contains(stderr, "do-not-print") {
+		t.Fatalf("cin output leaked plaintext: stdout=%q stderr=%q", stdout, stderr)
+	}
+}
+
 func testIdentity(t *testing.T) *age.X25519Identity {
 	t.Helper()
 	identity, err := age.GenerateX25519Identity()

@@ -6,7 +6,11 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"os/signal"
+	"sort"
 	"strings"
+	"syscall"
 
 	"cin/internal/config"
 	"cin/internal/cryptoage"
@@ -24,6 +28,10 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) int {
 	cmd.SetArgs(args)
 
 	if err := cmd.Execute(); err != nil {
+		var exitErr commandExitError
+		if errors.As(err, &exitErr) {
+			return exitErr.code
+		}
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
@@ -74,6 +82,7 @@ func NewRootCommand(stdout io.Writer, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newInitCommand(stdout, &filePath))
 	root.AddCommand(newSetCommand(&filePath))
 	root.AddCommand(newGetCommand(stdout, &filePath, &localFile, &noLocal, &user))
+	root.AddCommand(newRunCommand(stdout, stderr, &filePath, &localFile, &noLocal, &user))
 	root.AddCommand(newRenderCommand(stdout, &filePath, &localFile, &noLocal, &user))
 	root.AddCommand(newExplainCommand(stdout, &filePath, &localFile, &noLocal, &user))
 
@@ -251,6 +260,48 @@ func newGetCommand(stdout io.Writer, filePath *string, localFile *string, noLoca
 	return cmd
 }
 
+func newRunCommand(stdout io.Writer, stderr io.Writer, filePath *string, localFile *string, noLocal *bool, user *string) *cobra.Command {
+	var env string
+	var app string
+
+	cmd := &cobra.Command{
+		Use:   "run -e <env> -a <app> -- <command>",
+		Short: "Run a command with resolved app config",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if env == "" {
+				return errors.New("environment is required")
+			}
+			if app == "" {
+				return errors.New("cin run requires -a <app>\nfix: rerun with -a api")
+			}
+			doc, err := loadConfig(*filePath)
+			if err != nil {
+				return err
+			}
+			result, err := resolveResult(doc, *localFile, *noLocal, *user, env, app)
+			if err != nil {
+				return err
+			}
+			envVars, err := appEnv(result, app)
+			if err != nil {
+				return err
+			}
+			code, err := runChild(args, envVars, cmd.InOrStdin(), stdout, stderr)
+			if err != nil {
+				return err
+			}
+			if code != 0 {
+				return commandExitError{code: code}
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVarP(&env, "env", "e", "", "environment")
+	cmd.Flags().StringVarP(&app, "app", "a", "", "app")
+	return cmd
+}
+
 func newRenderCommand(stdout io.Writer, filePath *string, localFile *string, noLocal *bool, user *string) *cobra.Command {
 	var env string
 	var app string
@@ -377,6 +428,89 @@ func resolveResult(doc *config.Document, localFile string, noLocal bool, user st
 		return nil, err
 	}
 	return resolve.Env(resolved, app, identities)
+}
+
+func appEnv(result *resolve.Result, app string) (map[string]string, error) {
+	envVars := map[string]string{}
+	for _, key := range result.AppKeys() {
+		canonical := resolve.CanonicalPath(app, key)
+		if err := result.Resolve(canonical); err != nil {
+			return nil, err
+		}
+		value, _ := result.Value(canonical)
+		envVars[key] = value.Resolved
+	}
+	return envVars, nil
+}
+
+func runChild(args []string, envVars map[string]string, stdin io.Reader, stdout io.Writer, stderr io.Writer) (int, error) {
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Env = childEnv(envVars)
+	cmd.Stdin = stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+
+	if err := cmd.Start(); err != nil {
+		return 0, err
+	}
+
+	done := make(chan struct{})
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	go func() {
+		for {
+			select {
+			case sig := <-signals:
+				_ = cmd.Process.Signal(sig)
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	err := cmd.Wait()
+	close(done)
+	if err == nil {
+		return 0, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return processExitCode(exitErr), nil
+	}
+	return 0, err
+}
+
+func childEnv(envVars map[string]string) []string {
+	keys := make([]string, 0, len(envVars))
+	for key := range envVars {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	overrides := map[string]bool{}
+	for _, key := range keys {
+		overrides[key] = true
+	}
+
+	env := make([]string, 0, len(os.Environ())+len(envVars))
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if !overrides[key] {
+			env = append(env, entry)
+		}
+	}
+	for _, key := range keys {
+		env = append(env, key+"="+envVars[key])
+	}
+	return env
+}
+
+func processExitCode(err *exec.ExitError) int {
+	if status, ok := err.ProcessState.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+		return 128 + int(status.Signal())
+	}
+	return err.ExitCode()
 }
 
 func resolvedEnv(doc *config.Document, localFile string, noLocal bool, env string) (*yaml.Node, error) {
@@ -520,6 +654,14 @@ func missingValueError(doc *config.Document, env, app, key string) error {
 		}
 	}
 	return fmt.Errorf("value not found: %s", key)
+}
+
+type commandExitError struct {
+	code int
+}
+
+func (e commandExitError) Error() string {
+	return fmt.Sprintf("command exited with status %d", e.code)
 }
 
 func contains(values []string, value string) bool {
