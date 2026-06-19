@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +11,7 @@ import (
 	"cin/internal/config"
 	"cin/internal/cryptoage"
 	"cin/internal/envelope"
+	"cin/internal/resolve"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
@@ -74,6 +74,8 @@ func NewRootCommand(stdout io.Writer, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newInitCommand(stdout, &filePath))
 	root.AddCommand(newSetCommand(&filePath))
 	root.AddCommand(newGetCommand(stdout, &filePath, &localFile, &noLocal, &user))
+	root.AddCommand(newRenderCommand(stdout, &filePath, &localFile, &noLocal, &user))
+	root.AddCommand(newExplainCommand(stdout, &filePath, &localFile, &noLocal, &user))
 
 	return root
 }
@@ -219,8 +221,7 @@ func newGetCommand(stdout io.Writer, filePath *string, localFile *string, noLoca
 			if !ok {
 				return missingValueError(doc, env, app, key)
 			}
-			enc, err := envelope.Parse(value)
-			if err != nil {
+			if _, err := envelope.Parse(value); err != nil {
 				return fmt.Errorf("%s is plaintext, but all config values must be encrypted", key)
 			}
 			if !show {
@@ -228,29 +229,126 @@ func newGetCommand(stdout io.Writer, filePath *string, localFile *string, noLoca
 				return nil
 			}
 
-			currentUser, err := currentUser(*user)
+			result, err := resolveResult(doc, *localFile, *noLocal, *user, env, app)
 			if err != nil {
 				return err
 			}
-			identities, err := cryptoage.DiscoverIdentity(currentUser)
-			if err != nil {
+			canonical := strings.Join(path[2:], ".")
+			if err := result.Resolve(canonical); err != nil {
 				return err
 			}
-			plaintext, err := cryptoage.Decrypt(enc.Ciphertext, identities)
-			if err != nil {
-				return fmt.Errorf("cannot decrypt %s with current identity", key)
+			resolvedValue, ok := result.Value(canonical)
+			if !ok {
+				return missingValueError(doc, env, app, key)
 			}
-			rendered, err := decodePayload(plaintext)
-			if err != nil {
-				return err
-			}
-			fmt.Fprintf(stdout, "%s = %s\n", key, rendered)
+			fmt.Fprintf(stdout, "%s = %s\n", key, resolvedValue.Resolved)
 			return nil
 		},
 	}
 	cmd.Flags().StringVarP(&env, "env", "e", "", "environment")
 	cmd.Flags().StringVarP(&app, "app", "a", "", "app")
 	cmd.Flags().BoolVar(&show, "show", false, "show plaintext")
+	return cmd
+}
+
+func newRenderCommand(stdout io.Writer, filePath *string, localFile *string, noLocal *bool, user *string) *cobra.Command {
+	var env string
+	var app string
+	var show bool
+
+	cmd := &cobra.Command{
+		Use:   "render -e <env> -a <app>",
+		Short: "Render resolved app config",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if env == "" {
+				return errors.New("environment is required")
+			}
+			if app == "" {
+				return errors.New("app is required")
+			}
+			doc, err := loadConfig(*filePath)
+			if err != nil {
+				return err
+			}
+			result, err := resolveResult(doc, *localFile, *noLocal, *user, env, app)
+			if err != nil {
+				return err
+			}
+			for _, key := range result.AppKeys() {
+				canonical := resolve.CanonicalPath(app, key)
+				if err := result.Resolve(canonical); err != nil {
+					return err
+				}
+				value, _ := result.Value(canonical)
+				if show {
+					fmt.Fprintf(stdout, "%s=%s\n", key, value.Resolved)
+				} else if value.Kind == envelope.Template {
+					fmt.Fprintf(stdout, "%s=[secret template resolved]\n", key)
+				} else {
+					fmt.Fprintf(stdout, "%s=[secret]\n", key)
+				}
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVarP(&env, "env", "e", "", "environment")
+	cmd.Flags().StringVarP(&app, "app", "a", "", "app")
+	cmd.Flags().BoolVar(&show, "show", false, "show plaintext")
+	return cmd
+}
+
+func newExplainCommand(stdout io.Writer, filePath *string, localFile *string, noLocal *bool, user *string) *cobra.Command {
+	var env string
+	var app string
+
+	cmd := &cobra.Command{
+		Use:   "explain -e <env> [-a <app>] <key>",
+		Short: "Explain a resolved config value",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			doc, err := loadConfig(*filePath)
+			if err != nil {
+				return err
+			}
+			key := args[0]
+			path, err := targetPath(env, app, key)
+			if err != nil {
+				return err
+			}
+			result, err := resolveResult(doc, *localFile, *noLocal, *user, env, app)
+			if err != nil {
+				return err
+			}
+			canonical := strings.Join(path[2:], ".")
+			if err := result.Resolve(canonical); err != nil {
+				return err
+			}
+			value, ok := result.Value(canonical)
+			if !ok {
+				return missingValueError(doc, env, app, key)
+			}
+
+			kind := "encrypted scalar"
+			if value.Kind == envelope.Template {
+				kind = "encrypted template"
+			}
+			fmt.Fprintln(stdout, key)
+			fmt.Fprintf(stdout, "  source: envs.%s.%s\n", env, canonical)
+			fmt.Fprintf(stdout, "  kind: %s\n", kind)
+			fmt.Fprintf(stdout, "  recipientSet: %s\n", value.RecipientSet)
+			if len(value.References) > 0 {
+				fmt.Fprintln(stdout, "  references:")
+				for _, ref := range value.References {
+					fmt.Fprintf(stdout, "    %s ok secret\n", displayRef(app, ref))
+				}
+			}
+			fmt.Fprintln(stdout, "  result: [secret]")
+			return nil
+		},
+	}
+	cmd.Flags().StringVarP(&env, "env", "e", "", "environment")
+	cmd.Flags().StringVarP(&app, "app", "a", "", "app")
 	return cmd
 }
 
@@ -263,6 +361,22 @@ func loadConfig(path string) (*config.Document, error) {
 		return nil, fmt.Errorf("config file not found: %s\nfix: run `cin init <username>` or pass -f <file>", path)
 	}
 	return nil, err
+}
+
+func resolveResult(doc *config.Document, localFile string, noLocal bool, user string, env string, app string) (*resolve.Result, error) {
+	resolved, err := resolvedEnv(doc, localFile, noLocal, env)
+	if err != nil {
+		return nil, err
+	}
+	currentUser, err := currentUser(user)
+	if err != nil {
+		return nil, err
+	}
+	identities, err := cryptoage.DiscoverIdentity(currentUser)
+	if err != nil {
+		return nil, err
+	}
+	return resolve.Env(resolved, app, identities)
 }
 
 func resolvedEnv(doc *config.Document, localFile string, noLocal bool, env string) (*yaml.Node, error) {
@@ -388,32 +502,12 @@ func decodeJSONScalar(value string) (any, string, bool) {
 	}
 }
 
-func decodePayload(data []byte) (string, error) {
-	var payload struct {
-		Type  string          `json:"type"`
-		Value json.RawMessage `json:"value"`
+func displayRef(app string, ref string) string {
+	prefix := "apps." + app + ".values."
+	if strings.HasPrefix(ref, prefix) {
+		return "values." + strings.TrimPrefix(ref, prefix)
 	}
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return "", err
-	}
-	switch payload.Type {
-	case "string", "template":
-		var s string
-		if err := json.Unmarshal(payload.Value, &s); err != nil {
-			return "", err
-		}
-		return s, nil
-	case "number", "boolean":
-		return string(payload.Value), nil
-	case "array", "object":
-		var buf bytes.Buffer
-		if err := json.Compact(&buf, payload.Value); err != nil {
-			return "", err
-		}
-		return buf.String(), nil
-	default:
-		return "", fmt.Errorf("unknown payload type: %s", payload.Type)
-	}
+	return ref
 }
 
 func missingValueError(doc *config.Document, env, app, key string) error {
