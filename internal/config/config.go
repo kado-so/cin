@@ -21,6 +21,20 @@ type RecipientSet struct {
 	Recipients []string
 }
 
+type User struct {
+	Name          string
+	Age           string
+	Status        string
+	ApprovedBy    []string
+	RecipientSets []string
+}
+
+type EncryptedRef struct {
+	Path  []string
+	Value envelope.EncryptedValue
+	Raw   string
+}
+
 func New(username, publicKey string) *Document {
 	doc := &Document{root: yaml.Node{Kind: yaml.DocumentNode}}
 	root := mapNode()
@@ -184,15 +198,150 @@ func (d *Document) Recipients(set string) (RecipientSet, error) {
 	}
 	sort.Strings(users)
 
+	activeUsers := make([]string, 0, len(users))
 	recipients := make([]string, 0, len(users))
 	for _, user := range users {
 		key, ok := d.GetScalar([]string{"cin", "users", user, "age"})
 		if !ok || key == "" {
 			return RecipientSet{}, fmt.Errorf("recipient set %s references unknown user %s", set, user)
 		}
+		if !d.UserActive(user) {
+			continue
+		}
+		activeUsers = append(activeUsers, user)
 		recipients = append(recipients, key)
 	}
-	return RecipientSet{Users: users, Recipients: recipients}, nil
+	return RecipientSet{Users: activeUsers, Recipients: recipients}, nil
+}
+
+func (d *Document) AddUser(username, publicKey string) error {
+	if username == "" {
+		return errors.New("username is required")
+	}
+	if _, ok := d.GetScalar([]string{"cin", "users", username, "age"}); ok {
+		return fmt.Errorf("user already exists: %s", username)
+	}
+	setMap(d.ensureMap([]string{"cin", "users"}), username, mapNode(
+		pair("age", scalar(publicKey)),
+		pair("status", scalar("pending")),
+		pair("approvedBy", seqNode()),
+	))
+	if set, ok := d.GetScalar([]string{"cin", "defaults", "recipientSet"}); ok && set != "" {
+		d.AddUserToRecipientSet(username, set)
+	}
+	return nil
+}
+
+func (d *Document) Users() []User {
+	users := d.lookup([]string{"cin", "users"})
+	if users == nil || users.Kind != yaml.MappingNode {
+		return nil
+	}
+	out := make([]User, 0, len(users.Content)/2)
+	for i := 0; i < len(users.Content); i += 2 {
+		name := users.Content[i].Value
+		out = append(out, User{
+			Name:          name,
+			Age:           scalarIn(users.Content[i+1], "age"),
+			Status:        scalarIn(users.Content[i+1], "status"),
+			ApprovedBy:    stringsIn(users.Content[i+1], "approvedBy"),
+			RecipientSets: d.RecipientSetsForUser(name),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+func (d *Document) UserActive(username string) bool {
+	if !d.UserExists(username) {
+		return false
+	}
+	status := d.UserStatus(username)
+	return status == "active" || status == ""
+}
+
+func (d *Document) UserExists(username string) bool {
+	node := d.lookup([]string{"cin", "users", username})
+	return node != nil && node.Kind == yaml.MappingNode
+}
+
+func (d *Document) UserStatus(username string) string {
+	status, ok := d.GetScalar([]string{"cin", "users", username, "status"})
+	if !ok {
+		return ""
+	}
+	return status
+}
+
+func (d *Document) ApproveUser(username, approver string) error {
+	user := d.lookup([]string{"cin", "users", username})
+	if user == nil || user.Kind != yaml.MappingNode {
+		return fmt.Errorf("user not found: %s", username)
+	}
+	setMap(user, "status", scalar("active"))
+	approvedBy := getMap(user, "approvedBy")
+	if approvedBy == nil || approvedBy.Kind != yaml.SequenceNode {
+		approvedBy = seqNode()
+		setMap(user, "approvedBy", approvedBy)
+	}
+	for _, n := range approvedBy.Content {
+		if n.Kind == yaml.ScalarNode && n.Value == approver {
+			return nil
+		}
+	}
+	approvedBy.Content = append(approvedBy.Content, scalar(approver))
+	return nil
+}
+
+func (d *Document) RecipientSetNames() []string {
+	sets := d.lookup([]string{"cin", "recipientSets"})
+	if sets == nil || sets.Kind != yaml.MappingNode {
+		return nil
+	}
+	names := make([]string, 0, len(sets.Content)/2)
+	for i := 0; i < len(sets.Content); i += 2 {
+		names = append(names, sets.Content[i].Value)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func (d *Document) RecipientSetsForUser(username string) []string {
+	var out []string
+	for _, set := range d.RecipientSetNames() {
+		users := d.lookup([]string{"cin", "recipientSets", set, "users"})
+		if sequenceContains(users, username) {
+			out = append(out, set)
+		}
+	}
+	return out
+}
+
+func (d *Document) AddUserToRecipientSet(username, set string) {
+	users := d.lookup([]string{"cin", "recipientSets", set, "users"})
+	if users == nil || users.Kind != yaml.SequenceNode {
+		users = seqNode()
+		setMap(d.ensureMap([]string{"cin", "recipientSets", set}), "users", users)
+	}
+	if !sequenceContains(users, username) {
+		users.Content = append(users.Content, scalar(username))
+	}
+}
+
+func (d *Document) RemoveUser(username string) []string {
+	sets := d.RecipientSetsForUser(username)
+	for _, set := range sets {
+		users := d.lookup([]string{"cin", "recipientSets", set, "users"})
+		removeFromSequence(users, username)
+	}
+	deleteMap(d.ensureMap([]string{"cin", "users"}), username)
+	return sets
+}
+
+func (d *Document) EncryptedValues() []EncryptedRef {
+	var out []EncryptedRef
+	collectEncrypted(&out, d.root.Content[0], nil)
+	return out
 }
 
 func (d *Document) EnvNames() []string {
@@ -444,4 +593,76 @@ func scalar(value string) *yaml.Node {
 
 func pair(key string, value *yaml.Node) [2]*yaml.Node {
 	return [2]*yaml.Node{scalar(key), value}
+}
+
+func scalarIn(node *yaml.Node, key string) string {
+	child := getMap(node, key)
+	if child == nil || child.Kind != yaml.ScalarNode {
+		return ""
+	}
+	return child.Value
+}
+
+func stringsIn(node *yaml.Node, key string) []string {
+	child := getMap(node, key)
+	if child == nil || child.Kind != yaml.SequenceNode {
+		return nil
+	}
+	values := make([]string, 0, len(child.Content))
+	for _, n := range child.Content {
+		if n.Kind == yaml.ScalarNode && n.Value != "" {
+			values = append(values, n.Value)
+		}
+	}
+	sort.Strings(values)
+	return values
+}
+
+func sequenceContains(node *yaml.Node, value string) bool {
+	if node == nil || node.Kind != yaml.SequenceNode {
+		return false
+	}
+	for _, n := range node.Content {
+		if n.Kind == yaml.ScalarNode && n.Value == value {
+			return true
+		}
+	}
+	return false
+}
+
+func removeFromSequence(node *yaml.Node, value string) {
+	if node == nil || node.Kind != yaml.SequenceNode {
+		return
+	}
+	out := node.Content[:0]
+	for _, n := range node.Content {
+		if n.Kind != yaml.ScalarNode || n.Value != value {
+			out = append(out, n)
+		}
+	}
+	node.Content = out
+}
+
+func collectEncrypted(out *[]EncryptedRef, node *yaml.Node, path []string) {
+	if node == nil {
+		return
+	}
+	if node.Kind == yaml.MappingNode {
+		for i := 0; i < len(node.Content); i += 2 {
+			collectEncrypted(out, node.Content[i+1], append(path, node.Content[i].Value))
+		}
+		return
+	}
+	if node.Kind != yaml.ScalarNode {
+		return
+	}
+	value, err := envelope.Parse(node.Value)
+	if err != nil {
+		return
+	}
+	*out = append(*out, EncryptedRef{
+		Path:  append([]string(nil), path...),
+		Value: value,
+		Raw:   node.Value,
+	})
 }

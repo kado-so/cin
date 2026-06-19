@@ -2,6 +2,8 @@ package cli
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -533,6 +535,121 @@ func TestRunDoesNotPrintPlaintextFromCin(t *testing.T) {
 	}
 }
 
+func TestUsersApproveRekeysAndPreservesUnaffectedValues(t *testing.T) {
+	vaishnav := testIdentity(t)
+	alice := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", vaishnav.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	addRecipientSet(t, path, "prod", "vaishnav")
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "options.team.secret", "team-secret"})
+	runOK(t, []string{"-f", path, "set", "-e", "prod", "--recipient-set", "prod", "options.prod.secret", "prod-secret"})
+	prodBefore := encryptedScalar(t, path, []string{"envs", "prod", "options", "prod", "secret"})
+
+	runOK(t, []string{"-f", path, "users", "add", "alice", "--age", alice.Recipient().String()})
+	stdout, stderr, code := runCLI([]string{"-f", path, "users", "list"})
+	if code != 0 {
+		t.Fatalf("users list failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	for _, want := range []string{"USER", "alice", "pending", "team"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("users list missing %q: %q", want, stdout)
+		}
+	}
+
+	t.Setenv("CIN_AGE_KEY", alice.String())
+	stdout, stderr, code = runCLI([]string{"-f", path, "--user", "alice", "get", "-e", "dev", "options.team.secret", "--show"})
+	if code != 2 {
+		t.Fatalf("expected pending alice decrypt failure, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+
+	t.Setenv("CIN_AGE_KEY", vaishnav.String())
+	stdout, stderr, code = runCLIInput([]string{"-f", path, "--user", "vaishnav", "users", "approve", "alice"}, "approve\n")
+	if code != 0 {
+		t.Fatalf("approve failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	for _, want := range []string{"Approving alice", "team", "values to rekey: 1", "Type approve to continue:"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("approve summary missing %q: %q", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "team-secret") || strings.Contains(stderr, "team-secret") {
+		t.Fatalf("approve leaked plaintext: stdout=%q stderr=%q", stdout, stderr)
+	}
+	if got := encryptedScalar(t, path, []string{"envs", "prod", "options", "prod", "secret"}); got != prodBefore {
+		t.Fatal("unaffected prod value was not preserved byte-identical")
+	}
+
+	t.Setenv("CIN_AGE_KEY", alice.String())
+	stdout, stderr, code = runCLI([]string{"-f", path, "--user", "alice", "get", "-e", "dev", "options.team.secret", "--show"})
+	if code != 0 {
+		t.Fatalf("approved alice could not decrypt: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if got := strings.TrimSpace(stdout); got != "options.team.secret = team-secret" {
+		t.Fatalf("unexpected alice get output: %q", got)
+	}
+}
+
+func TestUsersApproveRequiresExactApproval(t *testing.T) {
+	vaishnav := testIdentity(t)
+	alice := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", vaishnav.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "options.secret", "secret"})
+	runOK(t, []string{"-f", path, "users", "add", "alice", "--age", alice.Recipient().String()})
+
+	_, stderr, code := runCLIInput([]string{"-f", path, "--user", "vaishnav", "users", "approve", "alice"}, "Approve\n")
+	if code != 2 {
+		t.Fatalf("expected approval cancellation, got code=%d stderr=%q", code, stderr)
+	}
+	if !strings.Contains(stderr, "approval cancelled") {
+		t.Fatalf("expected cancellation error, got %q", stderr)
+	}
+
+	t.Setenv("CIN_AGE_KEY", alice.String())
+	_, stderr, code = runCLI([]string{"-f", path, "--user", "alice", "get", "-e", "dev", "options.secret", "--show"})
+	if code != 2 {
+		t.Fatalf("expected alice to remain unable to decrypt, got code=%d stderr=%q", code, stderr)
+	}
+}
+
+func TestUsersRemoveRekeysAndWarns(t *testing.T) {
+	vaishnav := testIdentity(t)
+	alice := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", vaishnav.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "options.secret", "secret"})
+	runOK(t, []string{"-f", path, "users", "add", "alice", "--age", alice.Recipient().String()})
+	runOKInput(t, []string{"-f", path, "--user", "vaishnav", "users", "approve", "alice"}, "approve\n")
+
+	_, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "users", "remove", "alice"})
+	if code != 0 {
+		t.Fatalf("remove failed: code=%d stderr=%q", code, stderr)
+	}
+	for _, want := range []string{"warning: removing alice", "Git history", "rotate affected secrets"} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("remove warning missing %q: %q", want, stderr)
+		}
+	}
+
+	t.Setenv("CIN_AGE_KEY", alice.String())
+	_, stderr, code = runCLI([]string{"-f", path, "--user", "alice", "get", "-e", "dev", "options.secret", "--show"})
+	if code != 2 {
+		t.Fatalf("expected removed alice decrypt failure, got code=%d stderr=%q", code, stderr)
+	}
+
+	t.Setenv("CIN_AGE_KEY", vaishnav.String())
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "get", "-e", "dev", "options.secret", "--show"})
+	if code != 0 {
+		t.Fatalf("vaishnav could not decrypt after remove: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
 func testIdentity(t *testing.T) *age.X25519Identity {
 	t.Helper()
 	identity, err := age.GenerateX25519Identity()
@@ -567,6 +684,15 @@ func runOK(t *testing.T, args []string) string {
 	return stdout
 }
 
+func runOKInput(t *testing.T, args []string, input string) string {
+	t.Helper()
+	stdout, stderr, code := runCLIInput(args, input)
+	if code != 0 {
+		t.Fatalf("command %v failed: code=%d stdout=%q stderr=%q", args, code, stdout, stderr)
+	}
+	return stdout
+}
+
 func runCLI(args []string) (string, string, int) {
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -574,9 +700,53 @@ func runCLI(args []string) (string, string, int) {
 	return stdout.String(), stderr.String(), code
 }
 
+func runCLIInput(args []string, input string) (string, string, int) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd := NewRootCommand(&stdout, &stderr)
+	cmd.SetArgs(args)
+	cmd.SetIn(strings.NewReader(input))
+	if err := cmd.Execute(); err != nil {
+		var exitErr commandExitError
+		if errors.As(err, &exitErr) {
+			return stdout.String(), stderr.String(), exitErr.code
+		}
+		fmt.Fprintln(&stderr, err)
+		return stdout.String(), stderr.String(), 2
+	}
+	return stdout.String(), stderr.String(), 0
+}
+
 func setExtends(t *testing.T, path string, env string, parent string) {
 	t.Helper()
 	setRawScalar(t, path, []string{"envs", env, "extends"}, parent)
+}
+
+func addRecipientSet(t *testing.T, path string, set string, users ...string) {
+	t.Helper()
+	doc, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	for _, user := range users {
+		doc.AddUserToRecipientSet(user, set)
+	}
+	if err := doc.Save(path); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+}
+
+func encryptedScalar(t *testing.T, path string, yamlPath []string) string {
+	t.Helper()
+	doc, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	value, ok := doc.GetScalar(yamlPath)
+	if !ok {
+		t.Fatalf("missing scalar at %v", yamlPath)
+	}
+	return value
 }
 
 func setRawScalar(t *testing.T, path string, yamlPath []string, value string) {

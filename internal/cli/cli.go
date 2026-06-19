@@ -1,6 +1,9 @@
 package cli
 
 import (
+	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,11 +14,13 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 
 	"cin/internal/config"
 	"cin/internal/cryptoage"
 	"cin/internal/envelope"
 	"cin/internal/resolve"
+	"filippo.io/age"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 	"gopkg.in/yaml.v3"
@@ -85,6 +90,7 @@ func NewRootCommand(stdout io.Writer, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newRunCommand(stdout, stderr, &filePath, &localFile, &noLocal, &user))
 	root.AddCommand(newRenderCommand(stdout, &filePath, &localFile, &noLocal, &user))
 	root.AddCommand(newExplainCommand(stdout, &filePath, &localFile, &noLocal, &user))
+	root.AddCommand(newUsersCommand(stdout, stderr, &filePath, &user))
 
 	return root
 }
@@ -112,6 +118,145 @@ func newInitCommand(stdout io.Writer, filePath *string) *cobra.Command {
 			}
 			fmt.Fprintf(stdout, "created %s\n", *filePath)
 			return nil
+		},
+	}
+}
+
+func newUsersCommand(stdout io.Writer, stderr io.Writer, filePath *string, user *string) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "users",
+		Short: "Manage cin users",
+	}
+	cmd.AddCommand(newUsersAddCommand(stdout, filePath))
+	cmd.AddCommand(newUsersListCommand(stdout, filePath))
+	cmd.AddCommand(newUsersApproveCommand(stdout, filePath, user))
+	cmd.AddCommand(newUsersRemoveCommand(stderr, filePath, user))
+	return cmd
+}
+
+func newUsersAddCommand(stdout io.Writer, filePath *string) *cobra.Command {
+	var publicKey string
+	cmd := &cobra.Command{
+		Use:   "add <username>",
+		Short: "Add a pending user",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			doc, err := loadConfig(*filePath)
+			if err != nil {
+				return err
+			}
+			username := args[0]
+			if publicKey == "" {
+				identity, err := cryptoage.EnsureLocalIdentity(username)
+				if err != nil {
+					return err
+				}
+				publicKey = identity.Recipient().String()
+			}
+			if err := doc.AddUser(username, publicKey); err != nil {
+				return err
+			}
+			if err := doc.Save(*filePath); err != nil {
+				return err
+			}
+			fmt.Fprintf(stdout, "added pending user %s\n", username)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&publicKey, "age", "", "age public key")
+	return cmd
+}
+
+func newUsersListCommand(stdout io.Writer, filePath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "list",
+		Short: "List cin users",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			doc, err := loadConfig(*filePath)
+			if err != nil {
+				return err
+			}
+			w := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
+			fmt.Fprintln(w, "USER\tSTATUS\tFINGERPRINT\tRECIPIENT_SETS")
+			for _, user := range doc.Users() {
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
+					user.Name,
+					user.Status,
+					fingerprint(user.Age),
+					strings.Join(user.RecipientSets, ","),
+				)
+			}
+			return w.Flush()
+		},
+	}
+}
+
+func newUsersApproveCommand(stdout io.Writer, filePath *string, user *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "approve <username>",
+		Short: "Approve a pending user and rekey affected values",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			doc, err := loadConfig(*filePath)
+			if err != nil {
+				return err
+			}
+			current, identities, err := rekeyOperator(doc, *user)
+			if err != nil {
+				return err
+			}
+			username := args[0]
+			if !doc.UserExists(username) {
+				return fmt.Errorf("user not found: %s", username)
+			}
+			sets := doc.RecipientSetsForUser(username)
+			counts := impactCounts(doc, sets)
+			printApprovalSummary(stdout, username, sets, counts)
+			confirmation, err := readApproval(cmd.InOrStdin())
+			if err != nil {
+				return err
+			}
+			if confirmation != "approve" {
+				return errors.New("approval cancelled")
+			}
+			if err := doc.ApproveUser(username, current); err != nil {
+				return err
+			}
+			if _, err := rekey(doc, identities, sets); err != nil {
+				return err
+			}
+			return doc.Save(*filePath)
+		},
+	}
+}
+
+func newUsersRemoveCommand(stderr io.Writer, filePath *string, user *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "remove <username>",
+		Short: "Remove a user from recipient sets and rekey",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			doc, err := loadConfig(*filePath)
+			if err != nil {
+				return err
+			}
+			_, identities, err := rekeyOperator(doc, *user)
+			if err != nil {
+				return err
+			}
+			username := args[0]
+			if !doc.UserExists(username) {
+				return fmt.Errorf("user not found: %s", username)
+			}
+			sets := doc.RemoveUser(username)
+			fmt.Fprintf(stderr, "warning: removing %s prevents future decryption after rekey\n", username)
+			fmt.Fprintln(stderr, "warning: this cannot revoke plaintext already copied locally or secrets present in Git history")
+			fmt.Fprintf(stderr, "fix: rotate affected secrets if %s may have accessed them\n", username)
+			if _, err := rekey(doc, identities, sets); err != nil {
+				return err
+			}
+			return doc.Save(*filePath)
 		},
 	}
 }
@@ -654,6 +799,112 @@ func missingValueError(doc *config.Document, env, app, key string) error {
 		}
 	}
 	return fmt.Errorf("value not found: %s", key)
+}
+
+func rekeyOperator(doc *config.Document, userFlag string) (string, []age.Identity, error) {
+	current, err := currentUser(userFlag)
+	if err != nil {
+		return "", nil, err
+	}
+	if !doc.UserActive(current) {
+		return "", nil, fmt.Errorf("current user is not active: %s", current)
+	}
+	identities, err := cryptoage.DiscoverIdentity(current)
+	if err != nil {
+		return "", nil, err
+	}
+	return current, identities, nil
+}
+
+func rekey(doc *config.Document, identities []age.Identity, sets []string) (int, error) {
+	affected := setMapFromSlice(sets)
+	count := 0
+	for _, ref := range doc.EncryptedValues() {
+		if !affected[ref.Value.RecipientSet] {
+			continue
+		}
+		recipients, err := doc.Recipients(ref.Value.RecipientSet)
+		if err != nil {
+			return count, err
+		}
+		if sameStrings(ref.Value.Users, recipients.Users) {
+			continue
+		}
+		plaintext, err := cryptoage.Decrypt(ref.Value.Ciphertext, identities)
+		if err != nil {
+			return count, fmt.Errorf("cannot decrypt %s with current identity", strings.Join(ref.Path, "."))
+		}
+		ciphertext, err := cryptoage.Encrypt(plaintext, recipients.Recipients)
+		if err != nil {
+			return count, err
+		}
+		if err := doc.SetScalar(ref.Path, envelope.Format(envelope.EncryptedValue{
+			Kind:         ref.Value.Kind,
+			Algorithm:    envelope.AlgorithmAgeV1,
+			RecipientSet: ref.Value.RecipientSet,
+			Users:        recipients.Users,
+			Ciphertext:   ciphertext,
+		})); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, nil
+}
+
+func impactCounts(doc *config.Document, sets []string) map[string]int {
+	affected := setMapFromSlice(sets)
+	counts := map[string]int{}
+	for _, ref := range doc.EncryptedValues() {
+		if affected[ref.Value.RecipientSet] {
+			counts[ref.Value.RecipientSet]++
+		}
+	}
+	return counts
+}
+
+func printApprovalSummary(stdout io.Writer, username string, sets []string, counts map[string]int) {
+	fmt.Fprintf(stdout, "Approving %s will grant access through these recipient sets:\n\n", username)
+	for _, set := range sets {
+		fmt.Fprintf(stdout, "  %s\n", set)
+		fmt.Fprintf(stdout, "    values to rekey: %d\n", counts[set])
+	}
+	fmt.Fprintln(stdout)
+	fmt.Fprintf(stdout, "This will allow %s to decrypt values encrypted to those recipient sets.\n", username)
+	fmt.Fprint(stdout, "Type approve to continue: ")
+}
+
+func readApproval(r io.Reader) (string, error) {
+	line, err := bufio.NewReader(r).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
+}
+
+func fingerprint(publicKey string) string {
+	sum := sha256.Sum256([]byte(publicKey))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+func setMapFromSlice(values []string) map[string]bool {
+	out := make(map[string]bool, len(values))
+	for _, value := range values {
+		out[value] = true
+	}
+	return out
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 type commandExitError struct {

@@ -80,6 +80,27 @@ func EnsureIdentity(user string) (*age.X25519Identity, error) {
 	return identity, nil
 }
 
+func EnsureLocalIdentity(user string) (*age.X25519Identity, error) {
+	path := DefaultKeyPath(user)
+	if _, err := os.Stat(path); err == nil {
+		return firstX25519(identitiesFromFile(path))
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	identity, err := age.GenerateX25519Identity()
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(path, []byte(identity.String()+"\n"), 0o600); err != nil {
+		return nil, err
+	}
+	return identity, nil
+}
+
 func DefaultKeyPath(user string) string {
 	home, err := os.UserHomeDir()
 	if err != nil {
