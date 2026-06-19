@@ -18,8 +18,10 @@ import (
 
 	"cin/internal/config"
 	"cin/internal/cryptoage"
+	"cin/internal/doctor"
 	"cin/internal/envelope"
 	"cin/internal/resolve"
+	cinschema "cin/internal/schema"
 	"filippo.io/age"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -91,6 +93,7 @@ func NewRootCommand(stdout io.Writer, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newRenderCommand(stdout, &filePath, &localFile, &noLocal, &user))
 	root.AddCommand(newExplainCommand(stdout, &filePath, &localFile, &noLocal, &user))
 	root.AddCommand(newUsersCommand(stdout, stderr, &filePath, &user))
+	root.AddCommand(newDoctorCommand(stdout, &filePath, &localFile, &noLocal, &user))
 
 	return root
 }
@@ -428,6 +431,16 @@ func newRunCommand(stdout io.Writer, stderr io.Writer, filePath *string, localFi
 			if err != nil {
 				return err
 			}
+			schemas, err := cinschema.Discover(doc, *filePath)
+			if err != nil {
+				return err
+			}
+			if len(schemas.LoadErrors) > 0 {
+				return fmt.Errorf("schema file is invalid: %s: %v", schemas.LoadErrors[0].Path, schemas.LoadErrors[0].Err)
+			}
+			if errs := cinschema.ValidateResult(schemas, env, app, result); len(errs) > 0 {
+				return fmt.Errorf("schema validation failed: %s", errs[0].Err)
+			}
 			envVars, err := appEnv(result, app)
 			if err != nil {
 				return err
@@ -540,6 +553,46 @@ func newExplainCommand(stdout io.Writer, filePath *string, localFile *string, no
 				}
 			}
 			fmt.Fprintln(stdout, "  result: [secret]")
+			return nil
+		},
+	}
+	cmd.Flags().StringVarP(&env, "env", "e", "", "environment")
+	cmd.Flags().StringVarP(&app, "app", "a", "", "app")
+	return cmd
+}
+
+func newDoctorCommand(stdout io.Writer, filePath *string, localFile *string, noLocal *bool, user *string) *cobra.Command {
+	var env string
+	var app string
+
+	cmd := &cobra.Command{
+		Use:   "doctor",
+		Short: "Check config health",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			doc, err := loadConfig(*filePath)
+			if err != nil {
+				return err
+			}
+			localDoc, err := doctor.LoadLocal(*localFile, *noLocal)
+			if err != nil {
+				return err
+			}
+			schemas, err := cinschema.Discover(doc, *filePath)
+			if err != nil {
+				return err
+			}
+			hasErrors := doctor.Run(stdout, doc, schemas, localDoc, doctor.Options{
+				FilePath:  *filePath,
+				LocalFile: *localFile,
+				NoLocal:   *noLocal,
+				User:      *user,
+				Env:       env,
+				App:       app,
+			})
+			if hasErrors {
+				return commandExitError{code: 1}
+			}
 			return nil
 		},
 	}

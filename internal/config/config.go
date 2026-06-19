@@ -35,6 +35,14 @@ type EncryptedRef struct {
 	Raw   string
 }
 
+type ValueRef struct {
+	Env  string
+	App  string
+	Key  string
+	Path []string
+	Raw  string
+}
+
 func New(username, publicKey string) *Document {
 	doc := &Document{root: yaml.Node{Kind: yaml.DocumentNode}}
 	root := mapNode()
@@ -344,6 +352,26 @@ func (d *Document) EncryptedValues() []EncryptedRef {
 	return out
 }
 
+func (d *Document) ValueRefs() []ValueRef {
+	var out []ValueRef
+	for _, env := range d.EnvNames() {
+		envNode := d.lookup([]string{"envs", env})
+		collectValueRefs(&out, envNode, []string{"options"}, env, "")
+		apps := lookupNode(envNode, []string{"apps"})
+		if apps == nil || apps.Kind != yaml.MappingNode {
+			continue
+		}
+		for i := 0; i < len(apps.Content); i += 2 {
+			app := apps.Content[i].Value
+			collectValueRefs(&out, apps.Content[i+1], []string{"values"}, env, app)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return strings.Join(out[i].Path, ".") < strings.Join(out[j].Path, ".")
+	})
+	return out
+}
+
 func (d *Document) EnvNames() []string {
 	envs := d.lookup([]string{"envs"})
 	if envs == nil || envs.Kind != yaml.MappingNode {
@@ -368,6 +396,27 @@ func (d *Document) AppNames(env string) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+func (d *Document) ConfigSchemaGlobs() []string {
+	return stringsIn(d.lookup([]string{"cin"}), "configSchemas")
+}
+
+func (d *Document) EnvExtends(env string) ([]string, error) {
+	node := d.lookup([]string{"envs", env})
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil, nil
+	}
+	return extendsList(node)
+}
+
+func (d *Document) EnvDefaultRecipientSet(env string) string {
+	value, _ := d.GetScalar([]string{"envs", env, "defaults", "recipientSet"})
+	return value
+}
+
+func (d *Document) HasPath(path []string) bool {
+	return d.lookup(path) != nil
 }
 
 func OptionPath(key string) ([]string, bool) {
@@ -665,4 +714,35 @@ func collectEncrypted(out *[]EncryptedRef, node *yaml.Node, path []string) {
 		Value: value,
 		Raw:   node.Value,
 	})
+}
+
+func collectValueRefs(out *[]ValueRef, node *yaml.Node, path []string, env, app string) {
+	node = lookupNode(node, path)
+	if node == nil {
+		return
+	}
+	collectValueRefScalars(out, node, nil, env, app, path)
+}
+
+func collectValueRefScalars(out *[]ValueRef, node *yaml.Node, suffix []string, env, app string, root []string) {
+	if node == nil {
+		return
+	}
+	if node.Kind == yaml.MappingNode {
+		for i := 0; i < len(node.Content); i += 2 {
+			collectValueRefScalars(out, node.Content[i+1], append(suffix, node.Content[i].Value), env, app, root)
+		}
+		return
+	}
+	if node.Kind != yaml.ScalarNode {
+		return
+	}
+
+	key := strings.Join(suffix, ".")
+	path := append([]string{"envs", env}, root...)
+	if app != "" {
+		path = append([]string{"envs", env, "apps", app}, root...)
+	}
+	path = append(path, suffix...)
+	*out = append(*out, ValueRef{Env: env, App: app, Key: key, Path: path, Raw: node.Value})
 }

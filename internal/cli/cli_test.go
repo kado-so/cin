@@ -12,6 +12,7 @@ import (
 	"cin/internal/config"
 	"cin/internal/envelope"
 	"filippo.io/age"
+	"gopkg.in/yaml.v3"
 )
 
 func TestRunHelp(t *testing.T) {
@@ -535,6 +536,150 @@ func TestRunDoesNotPrintPlaintextFromCin(t *testing.T) {
 	}
 }
 
+func TestRunBlocksOnSchemaTypeErrors(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	dir := t.TempDir()
+	chdir(t, dir)
+	if err := os.MkdirAll(filepath.Join(dir, "apps", "api"), 0o700); err != nil {
+		t.Fatalf("mkdir schema dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "apps", "api", "cin.schema.yaml"), []byte(`
+app: api
+values:
+  type: object
+  properties:
+    PORT:
+      type: number
+`), 0o600); err != nil {
+		t.Fatalf("write schema: %v", err)
+	}
+
+	runOK(t, []string{"init", "vaishnav"})
+	setConfigSchemas(t, "configs.secret.yaml", "apps/*/cin.schema.yaml")
+	runOK(t, []string{"set", "-e", "dev", "-a", "api", "PORT", "not-a-number"})
+
+	stdout, stderr, code := runCLI([]string{"--user", "vaishnav", "run", "-e", "dev", "-a", "api", "--", "/bin/sh", "-c", "printf ran"})
+	if code != 2 {
+		t.Fatalf("expected schema failure, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("child command should not run, got stdout %q", stdout)
+	}
+	if !strings.Contains(stderr, "schema validation failed") || !strings.Contains(stderr, "PORT") {
+		t.Fatalf("expected schema error, got %q", stderr)
+	}
+}
+
+func TestRunBlocksOnMissingBaseRequiredWithEnvRequired(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	dir := t.TempDir()
+	chdir(t, dir)
+	if err := os.MkdirAll(filepath.Join(dir, "apps", "api"), 0o700); err != nil {
+		t.Fatalf("mkdir schema dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "apps", "api", "cin.schema.yaml"), []byte(`
+app: api
+values:
+  type: object
+  additionalProperties: false
+  required: [DATABASE_URL]
+  properties:
+    DATABASE_URL:
+      type: string
+envs:
+  prod:
+    values:
+      required: [SENTRY_DSN]
+      properties:
+        SENTRY_DSN:
+          type: string
+`), 0o600); err != nil {
+		t.Fatalf("write schema: %v", err)
+	}
+
+	runOK(t, []string{"init", "vaishnav"})
+	setConfigSchemas(t, "configs.secret.yaml", "apps/*/cin.schema.yaml")
+	runOK(t, []string{"set", "-e", "prod", "-a", "api", "SENTRY_DSN", "https://sentry.example"})
+
+	stdout, stderr, code := runCLI([]string{"--user", "vaishnav", "run", "-e", "prod", "-a", "api", "--", "/bin/sh", "-c", "printf ran"})
+	if code != 2 {
+		t.Fatalf("expected missing base-required schema failure, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("child command should not run, got stdout %q", stdout)
+	}
+	if !strings.Contains(stderr, "schema validation failed") || !strings.Contains(stderr, "DATABASE_URL") {
+		t.Fatalf("expected DATABASE_URL schema error, got %q", stderr)
+	}
+}
+
+func TestDoctorReportsSchemaAndPlaintextDiagnostics(t *testing.T) {
+	dir := t.TempDir()
+	chdir(t, dir)
+	if err := os.MkdirAll(filepath.Join(dir, "apps", "api"), 0o700); err != nil {
+		t.Fatalf("mkdir schema dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "apps", "api", "cin.schema.yaml"), []byte(`
+app: api
+values:
+  type: object
+  additionalProperties: false
+  required: [DATABASE_URL, REDIS_URL]
+  properties:
+    DATABASE_URL:
+      type: string
+    REDIS_URL:
+      type: string
+`), 0o600); err != nil {
+		t.Fatalf("write schema: %v", err)
+	}
+	if err := os.WriteFile("configs.secret.yaml", []byte(`
+cin:
+  version: 1
+  users:
+    vaishnav:
+      age: age1fake
+      status: active
+  recipientSets:
+    team:
+      users: [vaishnav]
+  configSchemas:
+    - "apps/*/cin.schema.yaml"
+    - "missing/*.yaml"
+envs:
+  dev:
+    apps:
+      api:
+        values:
+          DATABASE_URL: postgres://secret-password@db/app
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	stdout, stderr, code := runCLI([]string{"doctor", "-e", "dev", "-a", "api"})
+	if code != 1 {
+		t.Fatalf("expected doctor errors, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	for _, want := range []string{
+		"Encryption",
+		"envs.dev.apps.api.values.DATABASE_URL is plaintext value",
+		"schema glob missing/*.yaml matches no files",
+		"requires REDIS_URL",
+		"fix: cin set -e dev -a api REDIS_URL <value>",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("doctor output missing %q:\n%s", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "secret-password") || strings.Contains(stderr, "secret-password") {
+		t.Fatalf("doctor leaked plaintext: stdout=%q stderr=%q", stdout, stderr)
+	}
+}
+
 func TestUsersApproveRekeysAndPreservesUnaffectedValues(t *testing.T) {
 	vaishnav := testIdentity(t)
 	alice := testIdentity(t)
@@ -733,6 +878,34 @@ func addRecipientSet(t *testing.T, path string, set string, users ...string) {
 	}
 	if err := doc.Save(path); err != nil {
 		t.Fatalf("save config: %v", err)
+	}
+}
+
+func setConfigSchemas(t *testing.T, path string, patterns ...string) {
+	t.Helper()
+	var root map[string]any
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	cin, ok := root["cin"].(map[string]any)
+	if !ok {
+		t.Fatal("missing cin map")
+	}
+	items := make([]any, len(patterns))
+	for i, pattern := range patterns {
+		items[i] = pattern
+	}
+	cin["configSchemas"] = items
+	out, err := yaml.Marshal(root)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
 	}
 }
 

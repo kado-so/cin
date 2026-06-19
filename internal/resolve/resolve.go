@@ -19,6 +19,7 @@ type Value struct {
 	App          string
 	Raw          string
 	Kind         envelope.Kind
+	Type         string
 	RecipientSet string
 	Value        string
 	Resolved     string
@@ -164,12 +165,13 @@ func (r *Result) decode(v *Value) error {
 	if err != nil {
 		return fmt.Errorf("cannot decrypt %s with current identity", v.Path)
 	}
-	value, err := DecodePayload(plaintext)
+	value, typ, err := DecodePayloadTyped(plaintext)
 	if err != nil {
 		return err
 	}
 	v.Kind = enc.Kind
 	v.RecipientSet = enc.RecipientSet
+	v.Type = typ
 	v.Value = value
 	v.decoded = true
 	return nil
@@ -259,30 +261,35 @@ func actionRef(node *parse.ActionNode, app string) (string, error) {
 }
 
 func DecodePayload(data []byte) (string, error) {
+	value, _, err := DecodePayloadTyped(data)
+	return value, err
+}
+
+func DecodePayloadTyped(data []byte) (string, string, error) {
 	var payload struct {
 		Type  string          `json:"type"`
 		Value json.RawMessage `json:"value"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
-		return "", err
+		return "", "", err
 	}
 	switch payload.Type {
 	case "string", "template":
 		var s string
 		if err := json.Unmarshal(payload.Value, &s); err != nil {
-			return "", err
+			return "", "", err
 		}
-		return s, nil
+		return s, payload.Type, nil
 	case "number", "boolean":
-		return string(payload.Value), nil
+		return string(payload.Value), payload.Type, nil
 	case "array", "object":
 		var buf bytes.Buffer
 		if err := json.Compact(&buf, payload.Value); err != nil {
-			return "", err
+			return "", "", err
 		}
-		return buf.String(), nil
+		return buf.String(), payload.Type, nil
 	default:
-		return "", fmt.Errorf("unknown payload type: %s", payload.Type)
+		return "", "", fmt.Errorf("unknown payload type: %s", payload.Type)
 	}
 }
 
