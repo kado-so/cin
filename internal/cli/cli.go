@@ -11,8 +11,11 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"text/tabwriter"
 
@@ -90,6 +93,7 @@ func NewRootCommand(stdout io.Writer, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newSetCommand(&filePath))
 	root.AddCommand(newGetCommand(stdout, &filePath, &localFile, &noLocal, &user))
 	root.AddCommand(newRunCommand(stdout, stderr, &filePath, &localFile, &noLocal, &user))
+	root.AddCommand(newExportCommand(stdout, &filePath, &localFile, &noLocal, &user))
 	root.AddCommand(newRenderCommand(stdout, &filePath, &localFile, &noLocal, &user))
 	root.AddCommand(newExplainCommand(stdout, &filePath, &localFile, &noLocal, &user))
 	root.AddCommand(newUsersCommand(stdout, stderr, &filePath, &user))
@@ -423,25 +427,7 @@ func newRunCommand(stdout io.Writer, stderr io.Writer, filePath *string, localFi
 			if app == "" {
 				return errors.New("cin run requires -a <app>\nfix: rerun with -a api")
 			}
-			doc, err := loadConfig(*filePath)
-			if err != nil {
-				return err
-			}
-			result, err := resolveResult(doc, *localFile, *noLocal, *user, env, app)
-			if err != nil {
-				return err
-			}
-			schemas, err := cinschema.Discover(doc, *filePath)
-			if err != nil {
-				return err
-			}
-			if len(schemas.LoadErrors) > 0 {
-				return fmt.Errorf("schema file is invalid: %s: %v", schemas.LoadErrors[0].Path, schemas.LoadErrors[0].Err)
-			}
-			if errs := cinschema.ValidateResult(schemas, env, app, result); len(errs) > 0 {
-				return fmt.Errorf("schema validation failed: %s", errs[0].Err)
-			}
-			envVars, err := appEnv(result, app)
+			envVars, err := resolvedAppEnv(*filePath, *localFile, *noLocal, *user, env, app)
 			if err != nil {
 				return err
 			}
@@ -457,6 +443,50 @@ func newRunCommand(stdout io.Writer, stderr io.Writer, filePath *string, localFi
 	}
 	cmd.Flags().StringVarP(&env, "env", "e", "", "environment")
 	cmd.Flags().StringVarP(&app, "app", "a", "", "app")
+	return cmd
+}
+
+func newExportCommand(stdout io.Writer, filePath *string, localFile *string, noLocal *bool, user *string) *cobra.Command {
+	var env string
+	var app string
+	var format string
+	var out string
+	var yes bool
+
+	cmd := &cobra.Command{
+		Use:   "export -e <env> -a <app>",
+		Short: "Export resolved app config",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if env == "" {
+				return errors.New("environment is required")
+			}
+			if app == "" {
+				return errors.New("cin export requires -a <app>\nfix: rerun with -a api")
+			}
+			if out != "" && !yes {
+				return fmt.Errorf("refusing to write plaintext secrets to %s without confirmation\nfix: rerun with --yes", out)
+			}
+			envVars, err := resolvedAppEnv(*filePath, *localFile, *noLocal, *user, env, app)
+			if err != nil {
+				return err
+			}
+			data, err := formatExport(envVars, format)
+			if err != nil {
+				return err
+			}
+			if out == "" {
+				_, err = stdout.Write(data)
+				return err
+			}
+			return writeSecretFile(out, data)
+		},
+	}
+	cmd.Flags().StringVarP(&env, "env", "e", "", "environment")
+	cmd.Flags().StringVarP(&app, "app", "a", "", "app")
+	cmd.Flags().StringVar(&format, "format", "dotenv", "output format: dotenv or json")
+	cmd.Flags().StringVar(&out, "out", "", "write output to file")
+	cmd.Flags().BoolVar(&yes, "yes", false, "confirm plaintext file output")
 	return cmd
 }
 
@@ -628,6 +658,28 @@ func resolveResult(doc *config.Document, localFile string, noLocal bool, user st
 	return resolve.Env(resolved, app, identities)
 }
 
+func resolvedAppEnv(filePath string, localFile string, noLocal bool, user string, env string, app string) (map[string]string, error) {
+	doc, err := loadConfig(filePath)
+	if err != nil {
+		return nil, err
+	}
+	result, err := resolveResult(doc, localFile, noLocal, user, env, app)
+	if err != nil {
+		return nil, err
+	}
+	schemas, err := cinschema.Discover(doc, filePath)
+	if err != nil {
+		return nil, err
+	}
+	if len(schemas.LoadErrors) > 0 {
+		return nil, fmt.Errorf("schema file is invalid: %s: %v", schemas.LoadErrors[0].Path, schemas.LoadErrors[0].Err)
+	}
+	if errs := cinschema.ValidateResult(schemas, env, app, result); len(errs) > 0 {
+		return nil, fmt.Errorf("schema validation failed: %s", errs[0].Err)
+	}
+	return appEnv(result, app)
+}
+
 func appEnv(result *resolve.Result, app string) (map[string]string, error) {
 	envVars := map[string]string{}
 	for _, key := range result.AppKeys() {
@@ -639,6 +691,110 @@ func appEnv(result *resolve.Result, app string) (map[string]string, error) {
 		envVars[key] = value.Resolved
 	}
 	return envVars, nil
+}
+
+func formatExport(envVars map[string]string, format string) ([]byte, error) {
+	switch format {
+	case "dotenv":
+		var b strings.Builder
+		for _, key := range sortedKeys(envVars) {
+			fmt.Fprintf(&b, "%s=%s\n", key, dotenvValue(envVars[key]))
+		}
+		return []byte(b.String()), nil
+	case "json":
+		data, err := json.MarshalIndent(envVars, "", "  ")
+		if err != nil {
+			return nil, err
+		}
+		return append(data, '\n'), nil
+	default:
+		return nil, fmt.Errorf("unsupported export format: %s", format)
+	}
+}
+
+func dotenvValue(value string) string {
+	if value == "" || strings.ContainsAny(value, " \t\r\n\"'#$") {
+		return strconv.Quote(value)
+	}
+	return value
+}
+
+func sortedKeys(values map[string]string) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func writeSecretFile(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+func secureTempFile(pattern string) (*os.File, func(), error) {
+	dir, err := os.MkdirTemp("", "cin-edit-*")
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		os.RemoveAll(dir)
+		return nil, nil, err
+	}
+	file, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		os.RemoveAll(dir)
+		return nil, nil, err
+	}
+	if err := file.Chmod(0o600); err != nil {
+		file.Close()
+		os.RemoveAll(dir)
+		return nil, nil, err
+	}
+	cleanup := signalCleanup(dir)
+	return file, cleanup, nil
+}
+
+func signalCleanup(path string) func() {
+	done := make(chan struct{})
+	signals := make(chan os.Signal, 1)
+	var once sync.Once
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		select {
+		case sig := <-signals:
+			_ = os.RemoveAll(path)
+			signal.Stop(signals)
+			_ = syscall.Kill(syscall.Getpid(), sig.(syscall.Signal))
+		case <-done:
+		}
+	}()
+	return func() {
+		once.Do(func() {
+			close(done)
+			signal.Stop(signals)
+			_ = os.RemoveAll(path)
+		})
+	}
 }
 
 func runChild(args []string, envVars map[string]string, stdin io.Reader, stdout io.Writer, stderr io.Writer) (int, error) {

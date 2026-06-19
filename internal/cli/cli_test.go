@@ -617,6 +617,190 @@ envs:
 	}
 }
 
+func TestExportDotenvToStdout(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "DATABASE_URL", "postgres://db/app"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "token"})
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api"})
+	if code != 0 {
+		t.Fatalf("export failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if got := stdout; got != "API_TOKEN=token\nDATABASE_URL=postgres://db/app\n" {
+		t.Fatalf("unexpected dotenv export: %q", got)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+}
+
+func TestExportJSONToStdout(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "token"})
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--format", "json"})
+	if code != 0 {
+		t.Fatalf("export json failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if got := stdout; got != "{\n  \"API_TOKEN\": \"token\"\n}\n" {
+		t.Fatalf("unexpected json export: %q", got)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+}
+
+func TestExportRequiresApp(t *testing.T) {
+	stdout, stderr, code := runCLI([]string{"export", "-e", "dev"})
+	if code != 2 {
+		t.Fatalf("expected missing app failure, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "cin export requires -a <app>") {
+		t.Fatalf("expected app guidance, got %q", stderr)
+	}
+}
+
+func TestExportFileRequiresYesAndDoesNotLeakPlaintext(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "configs.secret.yaml")
+	out := filepath.Join(dir, ".env")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "do-not-leak"})
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--out", out})
+	if code != 2 {
+		t.Fatalf("expected confirmation failure, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("expected no stdout, got %q", stdout)
+	}
+	if !strings.Contains(stderr, "refusing to write plaintext secrets") || !strings.Contains(stderr, "--yes") {
+		t.Fatalf("expected confirmation guidance, got %q", stderr)
+	}
+	if strings.Contains(stdout, "do-not-leak") || strings.Contains(stderr, "do-not-leak") {
+		t.Fatalf("export error leaked plaintext: stdout=%q stderr=%q", stdout, stderr)
+	}
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Fatalf("expected no output file, stat err=%v", err)
+	}
+}
+
+func TestExportFileUsesRestrictivePermissions(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "configs.secret.yaml")
+	out := filepath.Join(dir, ".env")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "token"})
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--out", out, "--yes"})
+	if code != 0 {
+		t.Fatalf("export file failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "" || stderr != "" {
+		t.Fatalf("expected quiet file export, stdout=%q stderr=%q", stdout, stderr)
+	}
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read export: %v", err)
+	}
+	if string(data) != "API_TOKEN=token\n" {
+		t.Fatalf("unexpected file contents: %q", string(data))
+	}
+	info, err := os.Stat(out)
+	if err != nil {
+		t.Fatalf("stat export: %v", err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o600 {
+		t.Fatalf("expected 0600 file mode, got %03o", mode)
+	}
+}
+
+func TestExportBlocksOnSchemaTypeErrors(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	dir := t.TempDir()
+	chdir(t, dir)
+	if err := os.MkdirAll(filepath.Join(dir, "apps", "api"), 0o700); err != nil {
+		t.Fatalf("mkdir schema dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "apps", "api", "cin.schema.yaml"), []byte(`
+app: api
+values:
+  type: object
+  properties:
+    PORT:
+      type: number
+`), 0o600); err != nil {
+		t.Fatalf("write schema: %v", err)
+	}
+
+	runOK(t, []string{"init", "vaishnav"})
+	setConfigSchemas(t, "configs.secret.yaml", "apps/*/cin.schema.yaml")
+	runOK(t, []string{"set", "-e", "dev", "-a", "api", "PORT", "not-a-number"})
+
+	stdout, stderr, code := runCLI([]string{"--user", "vaishnav", "export", "-e", "dev", "-a", "api"})
+	if code != 2 {
+		t.Fatalf("expected schema failure, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("expected no stdout on schema failure, got %q", stdout)
+	}
+	if !strings.Contains(stderr, "schema validation failed") || !strings.Contains(stderr, "PORT") {
+		t.Fatalf("expected schema error, got %q", stderr)
+	}
+	if strings.Contains(stderr, "not-a-number") {
+		t.Fatalf("schema error leaked plaintext: %q", stderr)
+	}
+}
+
+func TestSecureTempFileUsesRestrictivePermissionsAndCleansUp(t *testing.T) {
+	file, cleanup, err := secureTempFile("value-*")
+	if err != nil {
+		t.Fatalf("create secure temp file: %v", err)
+	}
+	path := file.Name()
+	dir := filepath.Dir(path)
+	defer cleanup()
+	if err := file.Close(); err != nil {
+		t.Fatalf("close temp file: %v", err)
+	}
+
+	dirInfo, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat temp dir: %v", err)
+	}
+	if mode := dirInfo.Mode().Perm(); mode != 0o700 {
+		t.Fatalf("expected temp dir 0700, got %03o", mode)
+	}
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat temp file: %v", err)
+	}
+	if mode := fileInfo.Mode().Perm(); mode != 0o600 {
+		t.Fatalf("expected temp file 0600, got %03o", mode)
+	}
+
+	cleanup()
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("expected cleanup to remove temp dir, stat err=%v", err)
+	}
+}
+
 func TestDoctorReportsSchemaAndPlaintextDiagnostics(t *testing.T) {
 	dir := t.TempDir()
 	chdir(t, dir)
