@@ -1,0 +1,13 @@
+.DS_Store
+
+# Local encrypted overrides are machine-specific.
+configs.local.secret.yaml
+
+# Build outputs.
+/bin/
+/dist/
+/cin
+
+# Test and coverage outputs.
+*.test
+coverage.out

@@ -1,0 +1,1317 @@
+# cin implementation design
+
+`cin` is a serverless CLI for encrypted application config and secret injection.
+It stores all configuration in Git as encrypted YAML and injects resolved values
+into child processes at runtime. There is no daemon, hosted vault, API server, or
+external control plane.
+
+This document is the implementation contract for the first Go version.
+
+## Product principles
+
+- All app config values are secrets.
+- All options are secrets.
+- Templates are secrets because their structure can reveal infrastructure.
+- Only operational metadata is plaintext.
+- Secrets are injected at runtime, not written to disk.
+- Plaintext is never printed unless explicitly requested.
+- Encryption is per key, not whole-file.
+- Changing one value should not rewrite unrelated encrypted values.
+- Git diffs should be small and deterministic.
+- CI/CD is modeled as a normal user/recipient.
+
+## Non-goals
+
+- No backend service.
+- No hosted vault.
+- No daemon.
+- No remote API.
+- No automatic stale-recipient detection requirement.
+- No arbitrary code execution in templates.
+- No plaintext local override files.
+
+## User stories
+
+### Local app development
+
+Vaishnav wants to run the API locally with team defaults, but with a local
+Postgres host and Redis URL.
+
+```bash
+cin set -e vaishnav options.postgres.host host.docker.internal
+cin set -e vaishnav -a api REDIS_URL redis://localhost:6379
+cin run -e vaishnav -a api -- pnpm dev
+```
+
+`envs.vaishnav` can extend `envs.dev`, which can extend shared envs.
+Templates defined in parent envs are resolved after the child env is merged, so
+the child option values affect parent templates.
+
+### Shared dev config
+
+The team wants a shared dev environment checked into Git.
+
+```bash
+cin set -e dev options.postgres.host postgres
+cin set -e dev options.postgres.port 5432
+cin set -e dev -a api DATABASE_URL 'postgres://{{ .options.postgres.user }}:{{ .options.postgres.password }}@{{ .options.postgres.host }}:{{ .options.postgres.port }}/api'
+```
+
+Because the value contains `{{` and `}}`, `cin set` stores it as an encrypted
+template.
+
+### Production deploy from CI
+
+CI gets its own age identity and is approved like any other user.
+
+```bash
+cin users add ci-prod
+cin users approve ci-prod
+```
+
+GitHub Actions:
+
+```yaml
+- name: Deploy API
+  run: cin run -e prod -a api -- pnpm deploy
+  env:
+    CIN_USER: ci-prod
+    CIN_AGE_KEY: ${{ secrets.CIN_AGE_KEY }}
+```
+
+### Safe onboarding
+
+A new user is pending until an existing authorized user approves them.
+
+```bash
+cin users add alice
+cin users approve alice
+```
+
+`cin users approve alice` is interactive. It shows the recipient sets that
+include Alice and the values that will be rekeyed. The operator must type
+`approve` exactly before `cin` rekeys those values.
+
+### Plaintext leak prevention
+
+By default:
+
+```bash
+cin get -e prod -a api DATABASE_URL
+```
+
+prints:
+
+```text
+DATABASE_URL = [secret]
+```
+
+Plaintext requires explicit intent:
+
+```bash
+cin get -e prod -a api DATABASE_URL --show
+```
+
+## File layout
+
+The default shared config file is:
+
+```text
+configs.secret.yaml
+```
+
+The default local override file is:
+
+```text
+configs.local.secret.yaml
+```
+
+If `configs.local.secret.yaml` exists, it is loaded automatically and applied at
+highest precedence. It can be replaced with:
+
+```bash
+cin run --local-file path/to/local.secret.yaml -e vaishnav -a api -- pnpm dev
+```
+
+It can be disabled with:
+
+```bash
+cin run --no-local -e vaishnav -a api -- pnpm dev
+```
+
+Local override files may only contribute `envs`. Any `cin` metadata, users,
+recipient sets, or schemas in a local file are ignored. `cin doctor` warns when
+non-env data appears in a local file.
+
+## Recommended config schema
+
+Author-facing YAML uses compact encrypted scalars:
+
+```yaml
+cin:
+  version: 1
+
+  defaults:
+    recipientSet: team
+
+  users:
+    vaishnav:
+      age: age1vaishnav...
+      status: active
+      approvedBy: [vaishnav]
+
+    alice:
+      age: age1alice...
+      status: pending
+      approvedBy: []
+
+    ci-prod:
+      age: age1ciprod...
+      status: active
+      approvedBy: [vaishnav]
+
+  recipientSets:
+    team:
+      users: [vaishnav, alice]
+
+    prod:
+      users: [vaishnav, ci-prod]
+
+  configSchemas:
+    - "apps/*/cin.schema.yaml"
+    - "services/*/config.schema.yaml"
+
+envs:
+  shared:
+    defaults:
+      recipientSet: team
+
+    options:
+      postgres:
+        port: ENC[age-v1;set=team;users=vaishnav;data=...]
+        user: ENC[age-v1;set=team;users=vaishnav;data=...]
+        password: ENC[age-v1;set=team;users=vaishnav;data=...]
+
+  dev:
+    extends: shared
+    defaults:
+      recipientSet: team
+
+    options:
+      postgres:
+        host: ENC[age-v1;set=team;users=vaishnav;data=...]
+
+    apps:
+      api:
+        values:
+          DATABASE_URL: ENC_TEMPLATE[age-v1;set=team;users=vaishnav;data=...]
+          REDIS_URL: ENC[age-v1;set=team;users=vaishnav;data=...]
+
+      worker:
+        values:
+          DATABASE_URL: ENC_TEMPLATE[age-v1;set=team;users=vaishnav;data=...]
+
+  vaishnav:
+    extends: dev
+    options:
+      postgres:
+        host: ENC[age-v1;set=team;users=vaishnav;data=...]
+
+    apps:
+      api:
+        values:
+          REDIS_URL: ENC[age-v1;set=team;users=vaishnav;data=...]
+
+  prod:
+    extends: shared
+    defaults:
+      recipientSet: prod
+
+    options:
+      postgres:
+        host: ENC[age-v1;set=prod;users=vaishnav,ci-prod;data=...]
+
+    apps:
+      api:
+        values:
+          DATABASE_URL: ENC[age-v1;set=prod;users=vaishnav,ci-prod;data=...]
+```
+
+### Top-level sections
+
+`cin` contains only operational metadata:
+
+- `version`
+- `defaults`
+- `users`
+- `recipientSets`
+- `configSchemas`
+- future CLI metadata
+
+`envs` contains all secret-bearing configuration:
+
+- `defaults`
+- `extends`
+- `options`
+- `apps.<app>.values`
+
+There is no `userOverrides` section. Personal config is modeled as a normal env,
+for example `envs.vaishnav`.
+
+## Environment inheritance
+
+`extends` is explicit. There is no special `base` env.
+
+Valid forms:
+
+```yaml
+extends: dev
+```
+
+```yaml
+extends: [shared, dev]
+```
+
+Rules:
+
+- If `extends` is absent, the env inherits nothing.
+- If `extends` is a string, merge that parent first, then the child.
+- If `extends` is a list, merge parents left to right.
+- The rightmost parent has highest parent precedence.
+- The current env wins over all parents.
+- Local override file data wins over shared file data.
+- Missing parents are errors.
+- Inheritance cycles are errors.
+
+Example:
+
+```yaml
+envs:
+  shared:
+    options:
+      postgres:
+        port: ENC[...]
+
+  dev:
+    extends: shared
+    options:
+      postgres:
+        host: ENC[...]
+
+  vaishnav:
+    extends: dev
+    options:
+      postgres:
+        host: ENC[...]
+```
+
+Resolution for:
+
+```bash
+cin run -e vaishnav -a api -- pnpm dev
+```
+
+is:
+
+```text
+shared < dev < vaishnav < local vaishnav
+```
+
+### Merge semantics
+
+- Maps are deep-merged.
+- Scalars replace previous values.
+- Encrypted values replace previous values.
+- Encrypted templates replace previous values.
+- Arrays replace previous values, not concatenate.
+- `apps.<app>.values` is deep-merged by key.
+
+## Encrypted scalar format
+
+`cin` stores encrypted values in one-line compact scalars:
+
+```text
+ENC[age-v1;set=<recipientSet>;users=<sorted-users>;data=<base64url-age-ciphertext>]
+ENC_TEMPLATE[age-v1;set=<recipientSet>;users=<sorted-users>;data=<base64url-age-ciphertext>]
+```
+
+Example:
+
+```yaml
+DATABASE_URL: ENC_TEMPLATE[age-v1;set=team;users=alice,vaishnav;data=...]
+```
+
+The serialized format should be deterministic:
+
+- fields are ordered as `age-v1`, `set`, `users`, `data`
+- users are sorted by username
+- ciphertext is base64url without line wrapping
+- no public keys are repeated inside encrypted value metadata
+
+Internally, the parser normalizes this to a typed envelope:
+
+```go
+type EncryptedValue struct {
+    Kind         EncryptedKind // scalar or template
+    Algorithm    string        // age-v1
+    RecipientSet string
+    Users        []string
+    Ciphertext   []byte
+}
+```
+
+The public keys are stored once in `cin.users`.
+
+## Encryption model
+
+Each secret value is encrypted independently with age.
+
+Plaintext payload before encryption is a typed JSON object:
+
+```json
+{
+  "type": "string",
+  "value": "postgres://..."
+}
+```
+
+Template payload:
+
+```json
+{
+  "type": "template",
+  "value": "postgres://{{ .options.postgres.user }}:{{ .options.postgres.password }}@{{ .options.postgres.host }}:{{ .options.postgres.port }}/api"
+}
+```
+
+Typed option payloads may store JSON-compatible values:
+
+```json
+{
+  "type": "number",
+  "value": 5432
+}
+```
+
+`age` recipient public keys are looked up from:
+
+```text
+cin.recipientSets.<set>.users -> cin.users.<user>.age
+```
+
+### Identity discovery
+
+Current `cin` user:
+
+```text
+1. --user
+2. CIN_USER
+3. error
+```
+
+Age private key discovery:
+
+```text
+1. CIN_AGE_KEY
+2. CIN_AGE_KEY_FILE
+3. ~/.config/cin/keys/<user>.txt
+4. error
+```
+
+`cin` should not guess the current user by trying every key.
+
+## Recipient set selection
+
+When writing a value with `cin set`:
+
+```text
+if overwriting an existing encrypted value:
+  preserve that value's recipientSet
+else if envs.<env>.defaults.recipientSet exists:
+  use that recipient set
+else if cin.defaults.recipientSet exists:
+  use that recipient set
+else:
+  error
+```
+
+The recipient set may be overridden explicitly:
+
+```bash
+cin set -e prod -a api DATABASE_URL --recipient-set prod --prompt
+```
+
+`cin doctor` should warn when an env extends a parent whose default recipient
+set differs from the child. This is allowed, but it can surprise users when new
+values are written.
+
+## User lifecycle
+
+### Add
+
+```bash
+cin users add alice
+```
+
+Behavior:
+
+- Adds `cin.users.alice`.
+- Generates or accepts an age public key.
+- Sets status to `pending`.
+- Does not rekey existing values.
+
+Example metadata:
+
+```yaml
+alice:
+  age: age1alice...
+  status: pending
+  approvedBy: []
+```
+
+### Approve
+
+```bash
+cin users approve alice
+```
+
+Behavior:
+
+1. Verify current user is active.
+2. Show the recipient sets that include Alice.
+3. Show a redacted impact summary of values that will be rekeyed.
+4. Require the operator to type `approve`.
+5. Mark Alice active.
+6. Add current user to `approvedBy`.
+7. Rekey affected encrypted values.
+8. Preserve unrelated encrypted values unchanged.
+
+Approval is not cryptographic signing. `age` X25519 keys are encryption keys,
+not signing keys. `approvedBy` is authorization and audit metadata.
+
+Example prompt:
+
+```text
+Approving alice will grant access through these recipient sets:
+
+  team
+    users: alice, vaishnav
+    values to rekey: 42
+
+This will allow alice to decrypt values encrypted to those recipient sets.
+Type approve to continue:
+```
+
+### List
+
+```bash
+cin users list
+```
+
+Shows users, status, age public key fingerprint, and recipient sets.
+
+### Remove
+
+```bash
+cin users remove alice
+```
+
+Behavior:
+
+- Remove Alice from recipient sets.
+- Rekey affected values.
+- Warn that already-pulled plaintext and Git history cannot be revoked.
+
+Expected warning:
+
+```text
+warning: removing alice prevents future decryption after rekey
+warning: this cannot revoke plaintext already copied locally or secrets present in Git history
+fix: rotate affected secrets if alice may have accessed them
+```
+
+## Templates
+
+Templates use Go-style delimiters but allow only variable lookup.
+
+Example plaintext template before encryption:
+
+```gotemplate
+postgres://{{ .options.postgres.user }}:{{ .options.postgres.password }}@{{ .options.postgres.host }}:{{ .options.postgres.port }}/api
+```
+
+Template context uses lowercase map paths matching YAML:
+
+```text
+.options.postgres.host
+.apps.api.values.REDIS_URL
+.values.REDIS_URL
+```
+
+For a selected app, `.values` is an alias for:
+
+```text
+.apps.<selected-app>.values
+```
+
+### Template restrictions
+
+- No functions.
+- No pipelines.
+- No conditionals.
+- No ranges.
+- No method calls.
+- No arbitrary code execution.
+- Missing references fail closed.
+- Cycles fail closed.
+
+Implementation should parse with Go's `text/template/parse` package and walk
+the AST before execution. Only text nodes and simple field lookups are allowed.
+Do not rely only on an empty `FuncMap`, because Go templates have predefined
+global functions.
+
+### Template detection
+
+`cin set` auto-detects templates. If the provided value contains both `{{` and
+`}}`, store it as `ENC_TEMPLATE[...]`; otherwise store it as `ENC[...]`.
+
+There is no `set-template` command.
+
+### Resolution order
+
+For:
+
+```bash
+cin run -e vaishnav -a api -- pnpm dev
+```
+
+resolution is:
+
+```text
+1. Load shared config.
+2. Load local override config if present and not disabled.
+3. Resolve inheritance for selected env in shared config.
+4. Resolve inheritance for selected env in local config, if present.
+5. Merge shared resolved env with local resolved env.
+6. Decrypt all required values.
+7. Build template context from the final decrypted env graph.
+8. Resolve templates.
+9. Type-check resolved values using discovered schemas.
+10. Inject selected app values into the child process environment.
+```
+
+If a template in a parent env references an option overridden by a child env, the
+child value is used. Templates are resolved after inheritance and local overlay.
+
+### Cycle detection
+
+Template resolution builds a dependency graph. Cycles are errors.
+
+Example error:
+
+```text
+error template cycle detected
+path: values.API_URL -> values.BASE_URL -> values.API_URL
+```
+
+## CLI command semantics
+
+### Global flags
+
+Common flags:
+
+```text
+-f, --file <path>               default configs.secret.yaml
+--local-file <path>             default configs.local.secret.yaml when present
+--no-local                      disable local override file
+--user <username>               current cin user
+```
+
+Current user can also come from:
+
+```text
+CIN_USER
+```
+
+Commands that resolve env data require:
+
+```text
+-e, --env <env>
+```
+
+`cin run` requires:
+
+```text
+-a, --app <app>
+```
+
+### Init
+
+```bash
+cin init <username> -f configs.secret.yaml
+```
+
+Creates:
+
+- config file
+- initial active user
+- initial recipient set
+- empty `envs`
+- local age key if needed
+
+### Set
+
+`cin set` is the only config value write command.
+
+Set an option:
+
+```bash
+cin set -e dev options.postgres.host postgres
+cin set -e dev options.postgres.password --prompt
+```
+
+Writes:
+
+```text
+envs.dev.options.postgres.host
+envs.dev.options.postgres.password
+```
+
+Set an app value:
+
+```bash
+cin set -e dev -a api DATABASE_URL 'postgres://{{ .options.postgres.user }}@{{ .options.postgres.host }}/api'
+```
+
+Writes:
+
+```text
+envs.dev.apps.api.values.DATABASE_URL
+```
+
+Rules:
+
+- If path starts with `options.`, `-a` is not used.
+- If `-a` is provided, key is written under app values.
+- App value writes require `-a`.
+- Values may be provided positionally.
+- `--prompt` reads a value without echoing.
+- `--stdin` reads from stdin.
+- Values containing `{{` and `}}` are encrypted as templates.
+- Other values are encrypted as scalar values.
+
+### Get
+
+```bash
+cin get -e dev options.postgres.host
+cin get -e dev -a api DATABASE_URL
+```
+
+Default output is redacted:
+
+```text
+DATABASE_URL = [secret]
+```
+
+Plaintext requires:
+
+```bash
+cin get -e dev -a api DATABASE_URL --show
+```
+
+### Run
+
+```bash
+cin run -e dev -a api -- pnpm dev
+```
+
+Behavior:
+
+1. Resolve selected env.
+2. Resolve selected app.
+3. Decrypt needed options and app values.
+4. Resolve templates.
+5. Type-check against schemas.
+6. Inject selected app values into environment variables.
+7. Execute command.
+8. Return child process exit code.
+
+`run` requires `-a`. There is no "inject all apps" mode in MVP.
+
+Secrets are passed as environment variables, not command-line arguments.
+
+### Render
+
+```bash
+cin render -e dev -a api
+```
+
+Shows the resolved selected app config, redacted by default.
+
+```text
+DATABASE_URL=[secret template resolved]
+REDIS_URL=[secret]
+```
+
+Plaintext requires:
+
+```bash
+cin render -e dev -a api --show
+```
+
+### Explain
+
+```bash
+cin explain -e dev -a api DATABASE_URL
+```
+
+Shows source and dependency graph without printing values:
+
+```text
+DATABASE_URL
+  source: envs.dev.apps.api.values.DATABASE_URL
+  kind: encrypted template
+  recipientSet: team
+  references:
+    options.postgres.user      ok secret
+    options.postgres.password  ok secret
+    options.postgres.host      overridden by envs.vaishnav
+    options.postgres.port      ok secret
+  result: [secret]
+```
+
+### Export
+
+```bash
+cin export -e dev -a api --format dotenv --out .env
+```
+
+Rules:
+
+- Requires `-a`.
+- Writes plaintext only with explicit confirmation.
+- `--yes` is required for non-interactive file export.
+- Temporary files use restrictive permissions.
+
+### Users
+
+```bash
+cin users add <username>
+cin users approve <username>
+cin users list
+cin users remove <username>
+```
+
+`approve` replaces the earlier `sign` terminology.
+
+### Doctor
+
+```bash
+cin doctor
+cin doctor -f configs.secret.yaml
+cin doctor -e dev
+cin doctor -e dev -a api
+```
+
+Doctor is a first-class feature and must produce actionable diagnostics.
+
+## Schema discovery and type checking
+
+Schema files are discovered through:
+
+```yaml
+cin:
+  configSchemas:
+    - "apps/*/cin.schema.yaml"
+    - "services/*/config.schema.yaml"
+```
+
+The schema format should be JSON Schema-compatible YAML.
+
+Recommended app schema:
+
+```yaml
+cinSchema:
+  version: 1
+
+app: api
+
+values:
+  type: object
+  additionalProperties: false
+  required:
+    - DATABASE_URL
+    - REDIS_URL
+  properties:
+    DATABASE_URL:
+      type: string
+      format: uri
+    REDIS_URL:
+      type: string
+      format: uri
+    SENTRY_DSN:
+      type: string
+```
+
+Optional env-specific requirements:
+
+```yaml
+envs:
+  prod:
+    values:
+      required:
+        - SENTRY_DSN
+```
+
+Doctor and runtime should type-check resolved values against the schema for the
+selected app. App values are ultimately injected as environment variables, but
+the schema can validate their semantic type before conversion to string.
+
+Examples:
+
+- `type: string` injects the string.
+- `type: number` validates numeric input and injects its canonical string form.
+- `type: boolean` validates boolean input and injects `true` or `false`.
+- `type: object` or `array` validates JSON-compatible values and injects compact
+  JSON.
+
+## Doctor diagnostics
+
+Severity levels:
+
+```text
+error  blocks run/export
+warn   suspicious but allowed
+info   useful note
+```
+
+Categories:
+
+- Recipients
+- Users
+- Encryption
+- Env inheritance
+- Local overrides
+- Schemas
+- Templates
+- Values
+- Runtime
+
+### Required checks
+
+Recipients and users:
+
+- User is pending.
+- Recipient set references unknown user.
+- Active user is not present in any recipient set.
+- Current user cannot decrypt values they are expected to access.
+- Approval would grant access to a large or surprising set of values.
+
+Encryption:
+
+- App value is plaintext.
+- Option value is plaintext.
+- Template is plaintext.
+- Encrypted scalar is malformed.
+- Encrypted scalar references unknown recipient set.
+- Encrypted scalar's user list does not match current recipient set.
+
+Env inheritance:
+
+- Missing parent env.
+- Inheritance cycle.
+- Parent default recipient set differs from child default recipient set.
+- Local file includes ignored `cin` metadata.
+
+Schemas:
+
+- Schema glob matches no files.
+- Schema file is invalid.
+- Schema references unknown app.
+- Required key is missing.
+- Config key exists but schema does not declare it and `additionalProperties` is
+  false.
+- Key exists in one env but not another, unless schema allows it.
+- Resolved value has wrong type.
+
+Templates:
+
+- Missing reference.
+- Cycle.
+- Disallowed template action.
+- Template references an unknown app.
+- Template references a value current user cannot decrypt.
+
+Values:
+
+- Selected env is missing.
+- Selected app is missing.
+- App value cannot be converted to env var string.
+
+### Example output
+
+```text
+cin doctor
+
+Users
+  error alice is pending and cannot decrypt existing values
+    fix: cin users approve alice
+
+Recipients
+  error recipient set prod references unknown user ci-prod
+    fix: cin users add ci-prod
+
+Schemas
+  error apps/api/cin.schema.yaml requires REDIS_URL, but dev/api does not define it
+    fix: cin set -e dev -a api REDIS_URL <value>
+
+  warn STRIPE_SECRET_KEY exists in prod/api but is not declared by any schema
+    fix: add it to the schema or remove it
+
+Templates
+  error dev/api/DATABASE_URL references options.postgres.port, but that option is missing
+    fix: cin set -e dev options.postgres.port <value>
+
+  error dev/api/API_URL has a template cycle
+    path: values.API_URL -> values.BASE_URL -> values.API_URL
+
+Local overrides
+  warn configs.local.secret.yaml contains cin.users, which is ignored
+    fix: move user metadata to configs.secret.yaml
+```
+
+## Safety rules
+
+Hard rules:
+
+- Do not print plaintext unless `--show` is passed.
+- Do not log decrypted values.
+- Redact values in `doctor`, `diff`, `explain`, errors, and logs.
+- Do not pass secrets as child process command-line arguments.
+- Inject secrets as child process environment variables.
+- Exporting plaintext to a file requires confirmation or `--yes`.
+- Temporary files must be created with mode `0600`.
+- Temporary directories must be mode `0700`.
+- Cleanup temporary files on normal exit, error, SIGINT, and SIGTERM.
+- Avoid rewriting encrypted values that did not change.
+- Use deterministic YAML serialization.
+- Keep encrypted values one-line by default.
+- Fail on plaintext app values and options.
+
+## Error messages
+
+Missing config:
+
+```text
+error config file not found: configs.secret.yaml
+fix: run `cin init <username>` or pass `-f <file>`
+```
+
+Missing user:
+
+```text
+error current user is required
+fix: pass --user <username> or set CIN_USER
+```
+
+Missing env:
+
+```text
+error environment not found: prod
+available: dev, staging, vaishnav
+```
+
+Missing app:
+
+```text
+error app not found in env dev: api
+available: worker, web
+```
+
+Missing app flag for run:
+
+```text
+error cin run requires -a <app>
+fix: rerun with -a api
+```
+
+Cannot decrypt:
+
+```text
+error cannot decrypt dev/api/DATABASE_URL with current identity
+fix: check CIN_AGE_KEY or ask an active user to run `cin users approve <username>`
+```
+
+Plaintext value:
+
+```text
+error dev/api/REDIS_URL is plaintext, but all app config values must be encrypted
+fix: cin set -e dev -a api REDIS_URL <value>
+```
+
+Template missing reference:
+
+```text
+error dev/api/DATABASE_URL references missing value options.postgres.port
+fix: cin set -e dev options.postgres.port <value>
+```
+
+Template disallowed action:
+
+```text
+error dev/api/DATABASE_URL uses unsupported template syntax
+detail: only variable interpolation is allowed
+```
+
+Unsafe export:
+
+```text
+error refusing to write plaintext secrets to .env without confirmation
+fix: rerun with --yes
+```
+
+## Go implementation architecture
+
+Recommended package layout:
+
+```text
+cmd/cin/                 Cobra command wiring
+internal/config/         YAML model, parser, serializer, merge
+internal/envelope/       ENC[...] parser and formatter
+internal/cryptoage/      age encryption/decryption and key discovery
+internal/resolve/        env inheritance, local overlay, template resolution
+internal/schema/         JSON Schema discovery and validation
+internal/doctor/         diagnostics
+internal/run/            env injection and process execution
+internal/ui/             prompts, redaction, terminal output
+internal/testutil/       fixtures and age test keys
+```
+
+Recommended libraries:
+
+- `filippo.io/age` for encryption.
+- `gopkg.in/yaml.v3` for YAML AST parsing and serialization.
+- `github.com/spf13/cobra` for CLI commands.
+- `github.com/santhosh-tekuri/jsonschema/v6` or equivalent for JSON Schema.
+- `golang.org/x/term` for secret prompts.
+
+YAML handling should preserve enough structure to avoid noisy diffs. If comment
+preservation is too expensive in MVP, document that comments may be normalized.
+
+## Implementation phases
+
+### Phase 1: Core model and encryption
+
+- Define YAML structs and AST helpers.
+- Implement compact `ENC[...]` parser and serializer.
+- Implement deterministic serialization.
+- Implement age key discovery.
+- Implement per-key encrypt/decrypt.
+- Implement `cin init`.
+- Implement `cin set`.
+- Implement `cin get`.
+- Add unit tests for envelope parsing, serialization, and recipient lookup.
+
+Exit criteria:
+
+- A config can be initialized.
+- A value can be set and read back with `--show`.
+- Unchanged values remain byte-identical after unrelated writes.
+
+### Phase 2: Env resolution and local overrides
+
+- Implement `extends` string and list.
+- Implement cycle detection.
+- Implement merge semantics.
+- Implement local override loading.
+- Ignore local `cin` metadata.
+- Implement current user resolution.
+
+Exit criteria:
+
+- `shared < dev < vaishnav < local` resolves correctly.
+- Missing and cyclic inheritance produce clear errors.
+
+### Phase 3: Templates
+
+- Implement encrypted template detection in `cin set`.
+- Parse Go-template syntax.
+- Reject all non-variable actions.
+- Build dependency graph.
+- Resolve templates after env merge.
+- Detect missing references and cycles.
+- Implement `cin render`.
+- Implement `cin explain`.
+
+Exit criteria:
+
+- Parent templates use child option overrides.
+- Cycles and missing references fail closed.
+- No template can execute functions or control structures.
+
+### Phase 4: Runtime injection
+
+- Implement `cin run`.
+- Require `-e` and `-a`.
+- Inject selected app values into child environment.
+- Preserve child process exit code.
+- Redact all logs.
+- Add signal handling.
+
+Exit criteria:
+
+- `cin run -e dev -a api -- env` exposes resolved keys.
+- No plaintext is printed by `cin` itself.
+
+### Phase 5: Users and rekeying
+
+- Implement `cin users add`.
+- Implement `cin users list`.
+- Implement interactive `cin users approve`.
+- Implement `cin users remove`.
+- Implement rekeying for changed recipient sets.
+- Preserve unaffected values.
+
+Exit criteria:
+
+- Pending user cannot decrypt values.
+- Approved user can decrypt affected recipient sets.
+- Removed user cannot decrypt after rekey.
+
+### Phase 6: Schemas and doctor
+
+- Implement config schema glob discovery.
+- Implement JSON Schema validation.
+- Implement doctor categories and severities.
+- Implement plaintext detection.
+- Implement recipient set checks.
+- Implement template checks.
+- Implement local override warnings.
+
+Exit criteria:
+
+- `cin doctor` gives actionable errors and fixes.
+- `cin run` blocks on schema/type errors for selected app.
+
+### Phase 7: Export and edit
+
+- Implement `cin export`.
+- Add dotenv and JSON output.
+- Require confirmation for plaintext file writes.
+- Implement secure temp file support for future editing.
+- Optionally implement `cin edit` after temp file hardening.
+
+Exit criteria:
+
+- Export is explicit, confirmed, and tested for permissions.
+
+## Test plan
+
+### Unit tests
+
+Envelope parser:
+
+- Parses `ENC[...]`.
+- Parses `ENC_TEMPLATE[...]`.
+- Rejects unknown algorithms.
+- Rejects malformed fields.
+- Sorts users deterministically.
+- Serializes without public key repetition.
+
+YAML:
+
+- Loads valid config.
+- Rejects plaintext option values.
+- Rejects plaintext app values.
+- Writes compact encrypted scalars.
+- Preserves unrelated values on write.
+
+Merge:
+
+- Deep-merges maps.
+- Replaces arrays.
+- Replaces encrypted scalars.
+- Merges app values by key.
+- Applies rightmost parent precedence.
+- Applies local file highest precedence.
+
+Inheritance:
+
+- Supports `extends: dev`.
+- Supports `extends: [shared, dev]`.
+- Errors on missing parent.
+- Errors on cycle.
+
+Templates:
+
+- Resolves simple variable references.
+- Uses child env overrides for parent templates.
+- Fails on missing reference.
+- Fails on cycles.
+- Rejects functions.
+- Rejects pipelines.
+- Rejects `if`.
+- Rejects `range`.
+
+Recipient sets:
+
+- Selects existing value recipient set on overwrite.
+- Falls back to env default recipient set.
+- Falls back to global default recipient set.
+- Errors when no recipient set exists.
+
+### Integration tests
+
+Use real age keys generated in test fixtures.
+
+- `cin init` creates usable config.
+- `cin set` encrypts values.
+- `cin get --show` decrypts values.
+- `cin run` injects values into child process.
+- `cin run` requires `-a`.
+- Local override file changes rendered output.
+- `users add` creates pending user.
+- `users approve` rekeys after typed approval.
+- `users remove` rekeys and blocks removed user's key.
+- `doctor` catches plaintext values.
+- `doctor` catches schema mismatch.
+- `doctor` catches template cycle.
+
+### Security tests
+
+- `get` redacts by default.
+- `render` redacts by default.
+- `doctor` never prints plaintext.
+- `explain` never prints plaintext.
+- `run` does not put secrets in command args.
+- Export without `--yes` fails in non-interactive mode.
+- Temp files are `0600`.
+- Temp dirs are `0700`.
+- Signal cleanup removes temp files.
+
+### Golden tests
+
+Maintain fixtures for deterministic YAML output:
+
+- init output
+- set new option
+- set new app value
+- overwrite existing value
+- approve user rekey
+- remove user rekey
+- local override ignored metadata warning
+
+Golden tests should assert that unrelated encrypted values are byte-identical.
+
+## Open implementation notes
+
+- Approval metadata is not a cryptographic signature. If cryptographic signing is
+  needed later, add a separate signing key model.
+- JSON Schema validation should run on resolved decrypted values, not encrypted
+  envelopes.
+- `cin doctor` can inspect encrypted metadata without decryption, but type and
+  template checks require a working identity.
+- The local override file is powerful because it has highest precedence. It must
+  remain encrypted and should be gitignored by default.
+- Avoid adding more write commands. `cin set` should remain the main mutation
+  path unless a future workflow genuinely requires a separate command.

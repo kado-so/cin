@@ -1,0 +1,1 @@
+This is a simple CLI for config management. keep the design simple. use minimal code. always try to use LESS code. never write code for tons of "what if cases" unless they are in the spec. hardening does not mean convoluted implementation semantics. hardening means clear abstraction and implementation.
