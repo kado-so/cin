@@ -459,6 +459,7 @@ func newExportCommand(stdout io.Writer, stderr io.Writer, filePath *string, loca
 	var out string
 	var yes bool
 	var toStdout bool
+	var redactValues bool
 
 	cmd := &cobra.Command{
 		Use:   "export -e <env> -a <app>",
@@ -471,21 +472,24 @@ func newExportCommand(stdout io.Writer, stderr io.Writer, filePath *string, loca
 			if out != "" && toStdout {
 				return errors.New("choose either --out or --stdout")
 			}
-			if out != "" && !yes {
+			if !redactValues && out != "" && !yes {
 				return fmt.Errorf("refusing to write plaintext secrets to %s without confirmation\nfix: rerun with --yes", out)
 			}
-			if toStdout && !yes {
+			if !redactValues && toStdout && !yes {
 				return errors.New("refusing to write plaintext secrets to stdout without confirmation\nfix: rerun with --stdout --yes")
 			}
 			envVars, err := resolvedAppEnv(*filePath, *localFile, *noLocal, *user, env, app)
 			if err != nil {
 				return err
 			}
+			if redactValues {
+				redactEnv(envVars)
+			}
 			data, err := formatExport(envVars, format)
 			if err != nil {
 				return err
 			}
-			if toStdout {
+			if toStdout || (redactValues && out == "") {
 				_, err = stdout.Write(data)
 				return err
 			}
@@ -501,6 +505,7 @@ func newExportCommand(stdout io.Writer, stderr io.Writer, filePath *string, loca
 	cmd.Flags().StringVar(&out, "out", "", "write output to file")
 	cmd.Flags().BoolVar(&yes, "yes", false, "confirm plaintext file output")
 	cmd.Flags().BoolVar(&toStdout, "stdout", false, "write plaintext output to stdout")
+	cmd.Flags().BoolVar(&redactValues, "redact-values", false, "replace exported values with redacted markers")
 	return cmd
 }
 
@@ -604,35 +609,22 @@ func newRenderCommand(stdout io.Writer, filePath *string, localFile *string, noL
 			if app == "" {
 				return errors.New("app is required")
 			}
-			doc, err := loadConfig(*filePath)
+			envVars, err := resolvedAppEnv(*filePath, *localFile, *noLocal, *user, env, app)
 			if err != nil {
 				return err
 			}
-			env = effectiveEnv(doc, env)
-			result, err := resolveResult(doc, *localFile, *noLocal, *user, env, app)
+			redactEnv(envVars)
+			data, err := formatExport(envVars, "dotenv")
 			if err != nil {
 				return err
 			}
-			for _, key := range result.AppKeys() {
-				canonical := resolve.CanonicalPath(app, key)
-				if err := result.Resolve(canonical); err != nil {
-					return err
-				}
-				value, _ := result.Value(canonical)
-				if show {
-					fmt.Fprintf(stdout, "%s=%s\n", key, value.Resolved)
-				} else if value.Kind == envelope.Template {
-					fmt.Fprintf(stdout, "%s=[secret template resolved]\n", key)
-				} else {
-					fmt.Fprintf(stdout, "%s=[secret]\n", key)
-				}
-			}
-			return nil
+			_, err = stdout.Write(data)
+			return err
 		},
 	}
 	cmd.Flags().StringVarP(&env, "env", "e", "", "environment")
 	cmd.Flags().StringVarP(&app, "app", "a", "", "app")
-	cmd.Flags().BoolVar(&show, "show", false, "show plaintext")
+	cmd.Flags().BoolVar(&show, "show", false, "ignored; render is always redacted")
 	return cmd
 }
 
@@ -825,6 +817,12 @@ func appEnv(result *resolve.Result, app string) (map[string]string, error) {
 		envVars[key] = value.Resolved
 	}
 	return envVars, nil
+}
+
+func redactEnv(envVars map[string]string) {
+	for key := range envVars {
+		envVars[key] = "[secret]"
+	}
 }
 
 func formatExport(envVars map[string]string, format string) ([]byte, error) {

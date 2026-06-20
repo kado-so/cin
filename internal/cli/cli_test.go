@@ -333,7 +333,7 @@ func TestGetShowRequiresExplicitCurrentUser(t *testing.T) {
 	}
 }
 
-func TestRenderResolvesTemplateWithLocalOverride(t *testing.T) {
+func TestExportRedactValuesResolvesTemplateWithLocalOverride(t *testing.T) {
 	identity := testIdentity(t)
 	t.Setenv("CIN_AGE_KEY", identity.String())
 
@@ -348,20 +348,28 @@ func TestRenderResolvesTemplateWithLocalOverride(t *testing.T) {
 	runOK(t, []string{"-f", "configs.local.secret.yaml", "init", "local"})
 	runOK(t, []string{"-f", "configs.local.secret.yaml", "set", "-e", "dev", "options.postgres.host", "local"})
 
-	stdout, stderr, code := runCLI([]string{"--user", "vaishnav", "render", "-e", "dev", "-a", "api"})
+	stdout, stderr, code := runCLI([]string{"--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--redact-values"})
 	if code != 0 {
-		t.Fatalf("render redacted failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		t.Fatalf("export redacted failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if got := strings.TrimSpace(stdout); got != "DATABASE_URL=[secret template resolved]" {
-		t.Fatalf("unexpected redacted render: %q", got)
+	if got := strings.TrimSpace(stdout); got != "DATABASE_URL=[secret]" {
+		t.Fatalf("unexpected redacted export: %q", got)
 	}
 	if strings.Contains(stdout, "local") || strings.Contains(stdout, "postgres://") {
-		t.Fatalf("redacted render leaked plaintext: %q", stdout)
+		t.Fatalf("redacted export leaked plaintext: %q", stdout)
 	}
 
 	stdout, stderr, code = runCLI([]string{"--user", "vaishnav", "render", "-e", "dev", "-a", "api", "--show"})
 	if code != 0 {
-		t.Fatalf("render --show failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		t.Fatalf("render alias failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "DATABASE_URL=[secret]\n" {
+		t.Fatalf("render alias should stay redacted, got %q", stdout)
+	}
+
+	stdout, stderr, code = runCLI([]string{"--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--stdout", "--yes"})
+	if code != 0 {
+		t.Fatalf("plaintext export failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 	if got := strings.TrimSpace(stdout); got != "DATABASE_URL=postgres://local/api" {
 		t.Fatalf("expected local override in parent template, got %q", got)
@@ -386,7 +394,7 @@ func TestGetShowResolvesSelectedAppValuesAlias(t *testing.T) {
 	}
 }
 
-func TestRenderIgnoresUnrelatedBrokenAppTemplate(t *testing.T) {
+func TestExportIgnoresUnrelatedBrokenAppTemplate(t *testing.T) {
 	identity := testIdentity(t)
 	t.Setenv("CIN_AGE_KEY", identity.String())
 
@@ -395,16 +403,16 @@ func TestRenderIgnoresUnrelatedBrokenAppTemplate(t *testing.T) {
 	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "URL", "ok"})
 	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "worker", "BROKEN", "{{ .values.DOES_NOT_EXIST }}"})
 
-	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "render", "-e", "dev", "-a", "api", "--show"})
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--stdout", "--yes"})
 	if code != 0 {
-		t.Fatalf("render api failed due to unrelated app: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		t.Fatalf("export api failed due to unrelated app: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 	if got := strings.TrimSpace(stdout); got != "URL=ok" {
-		t.Fatalf("unexpected api render: %q", got)
+		t.Fatalf("unexpected api export: %q", got)
 	}
 }
 
-func TestRenderIgnoresUnrelatedUndecryptableAppValue(t *testing.T) {
+func TestExportIgnoresUnrelatedUndecryptableAppValue(t *testing.T) {
 	identity := testIdentity(t)
 	t.Setenv("CIN_AGE_KEY", identity.String())
 
@@ -413,16 +421,16 @@ func TestRenderIgnoresUnrelatedUndecryptableAppValue(t *testing.T) {
 	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "URL", "ok"})
 	setRawScalar(t, path, []string{"envs", "dev", "apps", "worker", "values", "SECRET"}, "ENC[age-v1;set=team;users=vaishnav;data=Y2lwaGVy]")
 
-	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "render", "-e", "dev", "-a", "api", "--show"})
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--stdout", "--yes"})
 	if code != 0 {
-		t.Fatalf("render api failed due to unrelated undecryptable app value: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		t.Fatalf("export api failed due to unrelated undecryptable app value: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 	if got := strings.TrimSpace(stdout); got != "URL=ok" {
-		t.Fatalf("unexpected api render: %q", got)
+		t.Fatalf("unexpected api export: %q", got)
 	}
 }
 
-func TestRenderFailsWhenReferencedCrossAppValueCannotDecrypt(t *testing.T) {
+func TestExportFailsWhenReferencedCrossAppValueCannotDecrypt(t *testing.T) {
 	identity := testIdentity(t)
 	t.Setenv("CIN_AGE_KEY", identity.String())
 
@@ -431,7 +439,7 @@ func TestRenderFailsWhenReferencedCrossAppValueCannotDecrypt(t *testing.T) {
 	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "URL", "https://{{ .apps.worker.values.X }}"})
 	setRawScalar(t, path, []string{"envs", "dev", "apps", "worker", "values", "X"}, "ENC[age-v1;set=team;users=vaishnav;data=Y2lwaGVy]")
 
-	_, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "render", "-e", "dev", "-a", "api", "--show"})
+	_, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--redact-values"})
 	if code != 2 {
 		t.Fatalf("expected referenced cross-app decrypt failure, got code=%d stderr=%q", code, stderr)
 	}
@@ -440,7 +448,7 @@ func TestRenderFailsWhenReferencedCrossAppValueCannotDecrypt(t *testing.T) {
 	}
 }
 
-func TestRenderValuesAliasUsesOwningWorkerApp(t *testing.T) {
+func TestExportValuesAliasUsesOwningWorkerApp(t *testing.T) {
 	identity := testIdentity(t)
 	t.Setenv("CIN_AGE_KEY", identity.String())
 
@@ -450,9 +458,9 @@ func TestRenderValuesAliasUsesOwningWorkerApp(t *testing.T) {
 	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "worker", "HOST", "worker.example"})
 	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "worker", "URL", "https://{{ .values.HOST }}"})
 
-	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "render", "-e", "dev", "-a", "worker", "--show"})
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "worker", "--stdout", "--yes"})
 	if code != 0 {
-		t.Fatalf("render worker failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		t.Fatalf("export worker failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 	if !strings.Contains(stdout, "URL=https://worker.example") {
 		t.Fatalf("expected worker alias to use worker HOST, got %q", stdout)
@@ -462,7 +470,7 @@ func TestRenderValuesAliasUsesOwningWorkerApp(t *testing.T) {
 	}
 }
 
-func TestRenderValuesAliasUsesSelectedAPIApp(t *testing.T) {
+func TestExportValuesAliasUsesSelectedAPIApp(t *testing.T) {
 	identity := testIdentity(t)
 	t.Setenv("CIN_AGE_KEY", identity.String())
 
@@ -472,9 +480,9 @@ func TestRenderValuesAliasUsesSelectedAPIApp(t *testing.T) {
 	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "worker", "HOST", "worker.example"})
 	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "URL", "https://{{ .values.HOST }}"})
 
-	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "render", "-e", "dev", "-a", "api", "--show"})
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--stdout", "--yes"})
 	if code != 0 {
-		t.Fatalf("render api failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		t.Fatalf("export api failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 	if !strings.Contains(stdout, "URL=https://api.example") {
 		t.Fatalf("expected api alias to use api HOST, got %q", stdout)
@@ -484,7 +492,7 @@ func TestRenderValuesAliasUsesSelectedAPIApp(t *testing.T) {
 	}
 }
 
-func TestRenderErrorsOnMissingTemplateReference(t *testing.T) {
+func TestExportErrorsOnMissingTemplateReference(t *testing.T) {
 	identity := testIdentity(t)
 	t.Setenv("CIN_AGE_KEY", identity.String())
 
@@ -492,7 +500,7 @@ func TestRenderErrorsOnMissingTemplateReference(t *testing.T) {
 	runOK(t, []string{"-f", path, "init", "vaishnav"})
 	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "URL", "https://{{ .options.missing.host }}"})
 
-	_, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "render", "-e", "dev", "-a", "api"})
+	_, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--redact-values"})
 	if code != 2 {
 		t.Fatalf("expected missing reference failure, got code=%d stderr=%q", code, stderr)
 	}
@@ -501,7 +509,7 @@ func TestRenderErrorsOnMissingTemplateReference(t *testing.T) {
 	}
 }
 
-func TestRenderErrorsOnTemplateCycle(t *testing.T) {
+func TestExportErrorsOnTemplateCycle(t *testing.T) {
 	identity := testIdentity(t)
 	t.Setenv("CIN_AGE_KEY", identity.String())
 
@@ -510,7 +518,7 @@ func TestRenderErrorsOnTemplateCycle(t *testing.T) {
 	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_URL", "{{ .values.BASE_URL }}"})
 	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "BASE_URL", "{{ .values.API_URL }}"})
 
-	_, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "render", "-e", "dev", "-a", "api"})
+	_, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--redact-values"})
 	if code != 2 {
 		t.Fatalf("expected cycle failure, got code=%d stderr=%q", code, stderr)
 	}
@@ -519,7 +527,7 @@ func TestRenderErrorsOnTemplateCycle(t *testing.T) {
 	}
 }
 
-func TestRenderRejectsUnsupportedTemplateSyntax(t *testing.T) {
+func TestExportRejectsUnsupportedTemplateSyntax(t *testing.T) {
 	identity := testIdentity(t)
 	t.Setenv("CIN_AGE_KEY", identity.String())
 
@@ -537,7 +545,7 @@ func TestRenderRejectsUnsupportedTemplateSyntax(t *testing.T) {
 			runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "HOST", "example.test"})
 			runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "URL", template})
 
-			_, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "render", "-e", "dev", "-a", "api"})
+			_, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--redact-values"})
 			if code != 2 {
 				t.Fatalf("expected unsupported syntax failure, got code=%d stderr=%q", code, stderr)
 			}
@@ -932,6 +940,61 @@ func TestExportJSONToStdout(t *testing.T) {
 	}
 }
 
+func TestExportRedactValuesDotenvDoesNotRequireYesAndMatchesPlaintextKeys(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "DATABASE_URL", "postgres://db/app"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "token"})
+
+	redacted, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--redact-values"})
+	if code != 0 {
+		t.Fatalf("redacted export failed: code=%d stdout=%q stderr=%q", code, redacted, stderr)
+	}
+	if redacted != "API_TOKEN=[secret]\nDATABASE_URL=[secret]\n" {
+		t.Fatalf("unexpected redacted dotenv export: %q", redacted)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	if strings.Contains(redacted, "token") || strings.Contains(redacted, "postgres://") {
+		t.Fatalf("redacted export leaked plaintext: %q", redacted)
+	}
+
+	plaintext, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--stdout", "--yes"})
+	if code != 0 {
+		t.Fatalf("plaintext export failed: code=%d stdout=%q stderr=%q", code, plaintext, stderr)
+	}
+	if got, want := strings.Join(dotenvKeys(redacted), ","), strings.Join(dotenvKeys(plaintext), ","); got != want {
+		t.Fatalf("redacted key set %q did not match plaintext key set %q", got, want)
+	}
+}
+
+func TestExportRedactValuesJSONDoesNotPrintPlaintext(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "token"})
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--format", "json", "--redact-values"})
+	if code != 0 {
+		t.Fatalf("redacted json export failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "{\n  \"API_TOKEN\": \"[secret]\"\n}\n" {
+		t.Fatalf("unexpected redacted json export: %q", stdout)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got %q", stderr)
+	}
+	if strings.Contains(stdout, "token") {
+		t.Fatalf("redacted json export leaked plaintext: %q", stdout)
+	}
+}
+
 func TestExportRequiresApp(t *testing.T) {
 	stdout, stderr, code := runCLI([]string{"export", "-e", "dev"})
 	if code != 2 {
@@ -1230,12 +1293,12 @@ EOF
 	if code != 0 {
 		t.Fatalf("edit option failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	stdout, stderr, code = runCLI([]string{"-f", path, "--user", "vaishnav", "render", "-e", "dev", "-a", "api", "--show"})
+	stdout, stderr, code = runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--stdout", "--yes"})
 	if code != 0 {
-		t.Fatalf("render edited option failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+		t.Fatalf("export edited option failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 	if got := strings.TrimSpace(stdout); got != "DATABASE_URL=postgres://db-new/api" {
-		t.Fatalf("unexpected rendered value: %q", got)
+		t.Fatalf("unexpected exported value: %q", got)
 	}
 }
 
@@ -1977,6 +2040,17 @@ func runCLIInput(args []string, input string) (string, string, int) {
 		return stdout.String(), stderr.String(), 2
 	}
 	return stdout.String(), stderr.String(), 0
+}
+
+func dotenvKeys(data string) []string {
+	var keys []string
+	for _, line := range strings.Split(strings.TrimSpace(data), "\n") {
+		key, _, ok := strings.Cut(line, "=")
+		if ok {
+			keys = append(keys, key)
+		}
+	}
+	return keys
 }
 
 func fakeEditor(t *testing.T, script string) string {
