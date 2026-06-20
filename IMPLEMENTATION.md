@@ -1088,116 +1088,194 @@ Recommended libraries:
 YAML handling should preserve enough structure to avoid noisy diffs. If comment
 preservation is too expensive in MVP, document that comments may be normalized.
 
-## Implementation phases
+## Test implementation plan
 
-### Phase 1: Core model and encryption
+Tests are part of the product spec. The durable product-level coverage should
+be written as behavioral stories first, with smaller unit, integration,
+security, and golden tests added only where they support or protect those
+stories.
 
-- Define YAML structs and AST helpers.
-- Implement compact `ENC[...]` parser and serializer.
-- Implement deterministic serialization.
-- Implement age key discovery.
-- Implement per-key encrypt/decrypt.
-- Implement `cin init`.
-- Implement `cin set`.
-- Implement `cin get`.
-- Add unit tests for envelope parsing, serialization, and recipient lookup.
+### Package layout
 
-Exit criteria:
+Behavioral tests live in a separate package:
 
-- A config can be initialized.
-- A value can be set and read back with `--show`.
-- Unchanged values remain byte-identical after unrelated writes.
+```text
+internal/behavior/
+```
 
-### Phase 2: Env resolution and local overrides
+Each behavioral story should live in its own test file. The file must start with
+a short top comment explaining the user story, why it matters, and the main
+future-regression invariant it protects.
 
-- Implement `extends` string and list.
-- Implement cycle detection.
-- Implement merge semantics.
-- Implement local override loading.
-- Ignore local `cin` metadata.
-- Implement current user resolution.
+Shared test harness code should live under `internal/behavior` or
+`internal/testutil` if lower-level package tests need it too. Existing package
+tests should stay next to the implementation when they test small invariants
+such as envelope parsing, merge behavior, template validation, and recipient-set
+selection.
 
-Exit criteria:
+Suggested behavioral story files:
 
-- `shared < dev < vaishnav < local` resolves correctly.
-- Missing and cyclic inheritance produce clear errors.
+```text
+internal/behavior/local_developer_story_test.go
+internal/behavior/shared_dev_templates_story_test.go
+internal/behavior/ci_approval_story_test.go
+internal/behavior/user_removal_story_test.go
+internal/behavior/doctor_broken_repo_story_test.go
+internal/behavior/export_safety_story_test.go
+internal/behavior/explain_provenance_story_test.go
+internal/behavior/edit_env_story_test.go
+```
 
-### Phase 3: Templates
+Example top comment:
 
-- Implement encrypted template detection in `cin set`.
-- Parse Go-template syntax.
-- Reject all non-variable actions.
-- Build dependency graph.
-- Resolve templates after env merge.
-- Detect missing references and cycles.
-- Implement `cin export --redact-values`.
-- Implement `cin explain`.
+```go
+// Story: a local developer inherits the shared dev environment, overrides only
+// their machine-specific options, and runs the API without writing plaintext.
+//
+// Protects: parent templates must resolve after local overrides, run must inject
+// only the selected app values, and secret values must never be printed by cin.
+```
 
-Exit criteria:
+### Behavioral harness
 
-- Parent templates use child option overrides.
-- Cycles and missing references fail closed.
-- No template can execute functions or control structures.
+Behavioral tests should exercise the CLI entrypoint directly through exported
+functions, not by shelling out to a compiled binary. This keeps tests fast while
+still covering Cobra parsing, config files, real `age` encryption, schema
+discovery, template resolution, user flows, local overrides, export behavior,
+and safety guards.
 
-### Phase 4: Runtime injection
+The harness should look roughly like:
 
-- Implement `cin run`.
-- Require `-e` and `-a`.
-- Inject selected app values into child environment.
-- Preserve child process exit code.
-- Redact all logs.
-- Add signal handling.
+```go
+type Story struct {
+    Dir        string
+    ConfigPath string
+    LocalPath  string
+    Home       string
+}
 
-Exit criteria:
+func NewStory(t *testing.T) *Story
+func (s *Story) Run(args ...string) Result
+func (s *Story) RunAs(user string, args ...string) Result
+func (s *Story) WriteSchema(app string, data string)
+func (s *Story) ReadConfig() string
+func (s *Story) AssertNoPlaintext(values ...string)
+```
 
-- `cin run -e dev -a api -- env` exposes resolved keys.
-- No plaintext is printed by `cin` itself.
+`Run` should call the CLI package function directly, such as `cli.Run(args,
+stdout, stderr)`, with temp working directories and temp `HOME`. It should not
+execute `cin` as a subprocess.
 
-### Phase 5: Users and rekeying
+The harness should also provide focused helpers for common behavioral
+assertions:
 
-- Implement `cin users add`.
-- Implement `cin users list`.
-- Implement interactive `cin users approve`.
-- Implement `cin users remove`.
-- Implement rekeying for changed recipient sets.
-- Preserve unaffected values.
+- Generate real age identities for named users.
+- Set `CIN_USER`, `CIN_AGE_KEY`, `HOME`, `PWD`, and optional local `.env` files.
+- Create app schema files under realistic `apps/<app>/cin.schema.yaml` paths.
+- Read encrypted YAML back and assert structurally on scalar form.
+- Assert sensitive values do not appear in stdout, stderr, YAML, explain,
+  doctor, or redacted export output.
+- Capture command execution without putting secrets in command-line arguments.
+- Replace editor and pager seams during tests.
 
-Exit criteria:
+### Story coverage
 
-- Pending user cannot decrypt values.
-- Approved user can decrypt affected recipient sets.
-- Removed user cannot decrypt after rekey.
+Write these as behavior tests, one story per file:
 
-### Phase 6: Schemas and doctor
+- Local developer inherits shared `dev`, applies local overrides, and runs API
+  with resolved injected env.
+- Shared dev config uses encrypted options and templates to derive app values.
+- CI is modeled as a normal user and can deploy only after approval.
+- Pending users cannot decrypt until `users approve` rekeys affected values.
+- Removed users cannot decrypt after rekey, with revocation warnings preserved.
+- Parent templates resolve using child env and local override option values.
+- `doctor` catches plaintext, schema mismatch, missing template refs, cycles,
+  unsigned users, and decrypt-skip cases without leaking values.
+- `export --redact-values` shows the resolved key set without plaintext.
+- Plaintext export requires explicit `--stdout --yes` or `--out --yes`.
+- `explain` shows dependency and override provenance without values.
+- `get` returns one value only.
+- `edit` allows whole-env editing without `-a`, preserves unavailable encrypted
+  values, and only writes validated changes.
 
-- Implement config schema glob discovery.
-- Implement JSON Schema validation.
-- Implement doctor categories and severities.
-- Implement plaintext detection.
-- Implement recipient set checks.
-- Implement template checks.
-- Implement local override warnings.
+### Structural and golden assertions
 
-Exit criteria:
+Behavioral tests should use real generated age keys and real encrypted config
+files. Golden assertions should be used for stable user-facing output such as
+`doctor`, `explain`, `users list`, and `export --redact-values`. Encrypted YAML
+should be checked structurally instead of golden-filed wholesale because `age`
+ciphertext is randomized.
 
-- `cin doctor` gives actionable errors and fixes.
-- `cin run` blocks on schema/type errors for selected app.
+Structural encrypted-YAML assertions:
 
-### Phase 7: Export and edit
+- Secret plaintext never appears in config files.
+- Secret values are stored as compact `ENC[...]` or `ENC_TEMPLATE[...]` scalars.
+- Unrelated encrypted scalars remain byte-identical after changing another key.
+- Rekeying changes only values in affected recipient sets.
+- Recipient metadata matches active recipient-set users.
 
-- Implement `cin export`.
-- Add dotenv and JSON output.
-- Require confirmation for plaintext file writes.
-- Implement secure temp file support for future editing.
-- Optionally implement `cin edit` after temp file hardening.
+Stable golden outputs to maintain:
 
-Exit criteria:
+- `cin init`
+- `cin set` for a new option
+- `cin set` for a new app value
+- `cin set` overwriting an existing value
+- `cin users approve`
+- `cin users remove`
+- `cin doctor`
+- `cin explain`
+- `cin users list`
+- `cin export --redact-values`
+- local override ignored-metadata warning
 
-- Export is explicit, confirmed, and tested for permissions.
+Golden tests must still assert that unrelated encrypted values are
+byte-identical after mutation.
 
-## Test plan
+### Testing `cin edit`
 
-### Unit tests
+`cin edit` should be tested as a behavioral story, but editor execution should
+use a test seam rather than a real editor when possible.
+
+Preferred seam:
+
+```go
+var runEditorCommand = runEditor
+```
+
+Production calls the real editor. Tests temporarily replace the seam:
+
+```go
+old := runEditorCommand
+runEditorCommand = func(editor []string, path string, stdin io.Reader, stdout, stderr io.Writer) error {
+    return os.WriteFile(path, editedYAML, 0o600)
+}
+t.Cleanup(func() { runEditorCommand = old })
+```
+
+This still exercises the real edit command flow: temp file creation, plaintext
+edit document rendering, YAML parsing, unknown-key rejection, schema/template
+validation, re-encryption, unchanged ciphertext preservation, and cleanup.
+
+If the seam is not available yet, tests may set `$VISUAL` to a small fake editor
+script that rewrites the provided temp path. That is closer to the real process
+model but more platform-sensitive.
+
+Edit behavior to cover:
+
+- `cin edit` uses the default env and edits all decryptable env data.
+- `cin edit -e dev` edits env-wide options and all app values.
+- `cin edit -e dev -a api` edits the focused app plus referenced options.
+- Undecryptable values are omitted and listed without plaintext.
+- Unknown sections, unknown apps, and unknown keys fail without saving.
+- Schema/template failures fail without saving.
+- Unchanged encrypted values stay byte-identical.
+- Temp dirs are `0700`, temp files are `0600`, and cleanup happens on success,
+  error, and signal.
+
+### Lower-level support tests
+
+These tests belong next to the packages they exercise. They are not the primary
+spec, but they make the story failures smaller and easier to diagnose.
 
 Envelope parser:
 
@@ -1250,9 +1328,11 @@ Recipient sets:
 - Falls back to global default recipient set.
 - Errors when no recipient set exists.
 
-### Integration tests
+### Command integration coverage
 
-Use real age keys generated in test fixtures.
+Command-level tests should use real age keys generated in test fixtures. They
+can share the behavioral harness when useful, but should stay focused on one
+command path at a time.
 
 - `cin init` creates usable config.
 - `cin set` encrypts values.
@@ -1267,7 +1347,7 @@ Use real age keys generated in test fixtures.
 - `doctor` catches schema mismatch.
 - `doctor` catches template cycle.
 
-### Security tests
+### Security and leak coverage
 
 - `get` redacts by default.
 - `export --redact-values` redacts values.
@@ -1278,20 +1358,6 @@ Use real age keys generated in test fixtures.
 - Temp files are `0600`.
 - Temp dirs are `0700`.
 - Signal cleanup removes temp files.
-
-### Golden tests
-
-Maintain fixtures for deterministic YAML output:
-
-- init output
-- set new option
-- set new app value
-- overwrite existing value
-- approve user rekey
-- remove user rekey
-- local override ignored metadata warning
-
-Golden tests should assert that unrelated encrypted values are byte-identical.
 
 ## Known remaining work
 
