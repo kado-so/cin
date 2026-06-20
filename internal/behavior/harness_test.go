@@ -83,12 +83,41 @@ func (s *Story) Run(args ...string) Result {
 	return Result{Stdout: stdout.String(), Stderr: stderr.String(), Code: code}
 }
 
+func (s *Story) RunWithInput(input string, args ...string) Result {
+	s.t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		s.t.Fatalf("create stdin pipe: %v", err)
+	}
+	if _, err := writer.WriteString(input); err != nil {
+		s.t.Fatalf("write stdin pipe: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		s.t.Fatalf("close stdin pipe writer: %v", err)
+	}
+	oldStdin := os.Stdin
+	os.Stdin = reader
+	defer func() {
+		os.Stdin = oldStdin
+		_ = reader.Close()
+	}()
+	return s.Run(args...)
+}
+
 func (s *Story) RunAs(user string, args ...string) Result {
 	s.t.Helper()
 	identity := s.Identity(user)
 	s.t.Setenv("CIN_USER", user)
 	s.t.Setenv("CIN_AGE_KEY", identity.String())
 	return s.Run(args...)
+}
+
+func (s *Story) RunAsWithInput(user string, input string, args ...string) Result {
+	s.t.Helper()
+	identity := s.Identity(user)
+	s.t.Setenv("CIN_USER", user)
+	s.t.Setenv("CIN_AGE_KEY", identity.String())
+	return s.RunWithInput(input, args...)
 }
 
 func (s *Story) OK(result Result) Result {
