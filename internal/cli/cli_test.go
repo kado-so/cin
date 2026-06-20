@@ -359,14 +359,6 @@ func TestExportRedactValuesResolvesTemplateWithLocalOverride(t *testing.T) {
 		t.Fatalf("redacted export leaked plaintext: %q", stdout)
 	}
 
-	stdout, stderr, code = runCLI([]string{"--user", "vaishnav", "render", "-e", "dev", "-a", "api", "--show"})
-	if code != 0 {
-		t.Fatalf("render alias failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
-	}
-	if stdout != "DATABASE_URL=[secret]\n" {
-		t.Fatalf("render alias should stay redacted, got %q", stdout)
-	}
-
 	stdout, stderr, code = runCLI([]string{"--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--stdout", "--yes"})
 	if code != 0 {
 		t.Fatalf("plaintext export failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)

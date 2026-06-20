@@ -101,7 +101,6 @@ func NewRootCommand(stdout io.Writer, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newRunCommand(stdout, stderr, &filePath, &localFile, &noLocal, &user))
 	root.AddCommand(newExportCommand(stdout, stderr, &filePath, &localFile, &noLocal, &user))
 	root.AddCommand(newEditCommand(&filePath, &user))
-	root.AddCommand(newRenderCommand(stdout, &filePath, &localFile, &noLocal, &user))
 	root.AddCommand(newExplainCommand(stdout, &filePath, &localFile, &noLocal, &user))
 	root.AddCommand(newUsersCommand(stdout, stderr, &filePath, &user))
 	root.AddCommand(newDoctorCommand(stdout, &filePath, &localFile, &noLocal, &user))
@@ -593,38 +592,6 @@ func newEditCommand(filePath *string, user *string) *cobra.Command {
 	}
 	cmd.Flags().StringVarP(&env, "env", "e", "", "environment")
 	cmd.Flags().StringVarP(&app, "app", "a", "", "app")
-	return cmd
-}
-
-func newRenderCommand(stdout io.Writer, filePath *string, localFile *string, noLocal *bool, user *string) *cobra.Command {
-	var env string
-	var app string
-	var show bool
-
-	cmd := &cobra.Command{
-		Use:   "render -e <env> -a <app>",
-		Short: "Render resolved app config",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if app == "" {
-				return errors.New("app is required")
-			}
-			envVars, err := resolvedAppEnv(*filePath, *localFile, *noLocal, *user, env, app)
-			if err != nil {
-				return err
-			}
-			redactEnv(envVars)
-			data, err := formatExport(envVars, "dotenv")
-			if err != nil {
-				return err
-			}
-			_, err = stdout.Write(data)
-			return err
-		},
-	}
-	cmd.Flags().StringVarP(&env, "env", "e", "", "environment")
-	cmd.Flags().StringVarP(&app, "app", "a", "", "app")
-	cmd.Flags().BoolVar(&show, "show", false, "ignored; render is always redacted")
 	return cmd
 }
 
