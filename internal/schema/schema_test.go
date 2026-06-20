@@ -12,10 +12,10 @@ import (
 
 func TestDiscoverReportsMissingGlobAndLoadsAppSchema(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, "apps", "api"), 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Join(dir, "apps", "services", "api"), 0o700); err != nil {
 		t.Fatalf("mkdir schema dir: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "apps", "api", "cin.schema.yaml"), []byte(`
+	if err := os.WriteFile(filepath.Join(dir, "apps", "services", "api", "cin.schema.yaml"), []byte(`
 app: api
 values:
   type: object
@@ -30,7 +30,7 @@ values:
 	doc := loadDoc(t, `
 cin:
   configSchemas:
-    - "apps/*/cin.schema.yaml"
+    - "apps/**/cin.schema.yaml"
     - "missing/*.yaml"
 envs: {}
 `)

@@ -6,6 +6,7 @@ require (
 	filippo.io/age v1.2.1
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	github.com/spf13/cobra v1.10.2
+	github.com/yargevad/filepathx v1.0.0
 	golang.org/x/term v0.27.0
 	gopkg.in/yaml.v3 v3.0.1
 )

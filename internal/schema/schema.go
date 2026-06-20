@@ -12,6 +12,7 @@ import (
 	"cin/internal/config"
 	"cin/internal/resolve"
 	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
+	"github.com/yargevad/filepathx"
 	"gopkg.in/yaml.v3"
 )
 
@@ -53,7 +54,7 @@ func Discover(doc *config.Document, configPath string) (*Set, error) {
 	}
 	out := &Set{}
 	for _, pattern := range doc.ConfigSchemaGlobs() {
-		matches, err := filepath.Glob(filepath.Join(base, pattern))
+		matches, err := filepathx.Glob(filepath.Join(base, pattern))
 		if err != nil {
 			return nil, fmt.Errorf("invalid schema glob %s: %w", pattern, err)
 		}
