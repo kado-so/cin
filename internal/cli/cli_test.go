@@ -79,16 +79,16 @@ func TestInitSetGetPhase1Flow(t *testing.T) {
 	if strings.Contains(stdout, " = postgres") {
 		t.Fatalf("redacted get leaked plaintext: %q", stdout)
 	}
-	if got := strings.TrimSpace(stdout); got != "options.postgres.host = [secret]" {
-		t.Fatalf("unexpected redacted output: %q", got)
+	if stdout != "[secret]\n" {
+		t.Fatalf("unexpected redacted output: %q", stdout)
 	}
 
 	stdout, stderr, code = runCLI([]string{"-f", path, "--user", "vaishnav", "get", "-e", "dev", "options.postgres.host", "--show"})
 	if code != 0 {
 		t.Fatalf("get --show failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if got := strings.TrimSpace(stdout); got != "options.postgres.host = postgres" {
-		t.Fatalf("unexpected plaintext output: %q", got)
+	if stdout != "postgres\n" {
+		t.Fatalf("unexpected plaintext output: %q", stdout)
 	}
 }
 
@@ -158,7 +158,7 @@ func TestGetAppliesLocalOverrideAtHighestPrecedence(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("get with default local failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if got := strings.TrimSpace(stdout); got != "options.postgres.host = local" {
+	if got := strings.TrimSpace(stdout); got != "local" {
 		t.Fatalf("expected default local override, got %q", got)
 	}
 
@@ -166,7 +166,7 @@ func TestGetAppliesLocalOverrideAtHighestPrecedence(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("get with --no-local failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if got := strings.TrimSpace(stdout); got != "options.postgres.host = shared" {
+	if got := strings.TrimSpace(stdout); got != "shared" {
 		t.Fatalf("expected shared value with --no-local, got %q", got)
 	}
 
@@ -176,7 +176,7 @@ func TestGetAppliesLocalOverrideAtHighestPrecedence(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("get with --local-file failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if got := strings.TrimSpace(stdout); got != "options.postgres.host = custom" {
+	if got := strings.TrimSpace(stdout); got != "custom" {
 		t.Fatalf("expected chosen local override, got %q", got)
 	}
 }
@@ -195,7 +195,7 @@ func TestEnvDefaultResolutionUsesExplicitEnv(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("get explicit env failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if got := strings.TrimSpace(stdout); got != "API_TOKEN = dev-token" {
+	if got := strings.TrimSpace(stdout); got != "dev-token" {
 		t.Fatalf("expected explicit env value, got %q", got)
 	}
 }
@@ -213,7 +213,7 @@ func TestEnvDefaultResolutionUsesCinDefaultEnv(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("get default env failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if got := strings.TrimSpace(stdout); got != "API_TOKEN = prod-token" {
+	if got := strings.TrimSpace(stdout); got != "prod-token" {
 		t.Fatalf("expected cin.defaults.env value, got %q", got)
 	}
 }
@@ -230,7 +230,7 @@ func TestEnvDefaultResolutionFallsBackToDev(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("get fallback env failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if got := strings.TrimSpace(stdout); got != "API_TOKEN = dev-token" {
+	if got := strings.TrimSpace(stdout); got != "dev-token" {
 		t.Fatalf("expected fallback dev value, got %q", got)
 	}
 }
@@ -287,7 +287,7 @@ func TestRunLoadsLocalDotenvForCinRuntimeSettings(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("get using .env settings failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if got := strings.TrimSpace(stdout); got != "options.postgres.host = postgres" {
+	if got := strings.TrimSpace(stdout); got != "postgres" {
 		t.Fatalf("expected decrypted value using .env settings, got %q", got)
 	}
 }
@@ -310,7 +310,7 @@ func TestEnvDefaultResolutionLoadsLocalOverrideForDefaultedEnv(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("get default env with local override failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if got := strings.TrimSpace(stdout); got != "API_TOKEN = local-token" {
+	if got := strings.TrimSpace(stdout); got != "local-token" {
 		t.Fatalf("expected local override for defaulted env, got %q", got)
 	}
 }
@@ -381,7 +381,7 @@ func TestGetShowResolvesSelectedAppValuesAlias(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("get template failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if got := strings.TrimSpace(stdout); got != "URL = https://example.test/v1" {
+	if got := strings.TrimSpace(stdout); got != "https://example.test/v1" {
 		t.Fatalf("unexpected resolved get output: %q", got)
 	}
 }
@@ -1052,7 +1052,7 @@ EOF
 	if code != 0 {
 		t.Fatalf("get edited value failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if got := strings.TrimSpace(stdout); got != "API_TOKEN = new-token" {
+	if got := strings.TrimSpace(stdout); got != "new-token" {
 		t.Fatalf("unexpected edited value: %q", got)
 	}
 }
@@ -1131,28 +1131,28 @@ EOF
 	if code != 0 {
 		t.Fatalf("get option failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if got := strings.TrimSpace(stdout); got != "options.postgres.host = db-new" {
-		t.Fatalf("unexpected option value: %q", got)
+	if stdout != "db-new\n" {
+		t.Fatalf("unexpected option value: %q", stdout)
 	}
 	stdout, stderr, code = runCLI([]string{"-f", path, "--user", "vaishnav", "get", "-e", "prod", "-a", "api", "API_TOKEN", "--show"})
 	if code != 0 {
 		t.Fatalf("get api value failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if got := strings.TrimSpace(stdout); got != "API_TOKEN = new-token" {
-		t.Fatalf("unexpected api value: %q", got)
+	if stdout != "new-token\n" {
+		t.Fatalf("unexpected api value: %q", stdout)
 	}
 	stdout, stderr, code = runCLI([]string{"-f", path, "--user", "vaishnav", "get", "-e", "prod", "-a", "worker", "QUEUE", "--show"})
 	if code != 0 {
 		t.Fatalf("get worker value failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if got := strings.TrimSpace(stdout); got != "QUEUE = new-queue" {
+	if got := strings.TrimSpace(stdout); got != "new-queue" {
 		t.Fatalf("unexpected worker value: %q", got)
 	}
 	stdout, stderr, code = runCLI([]string{"-f", path, "--user", "vaishnav", "get", "-e", "dev", "-a", "api", "API_TOKEN", "--show"})
 	if code != 0 {
 		t.Fatalf("get dev value failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if got := strings.TrimSpace(stdout); got != "API_TOKEN = dev-token" {
+	if got := strings.TrimSpace(stdout); got != "dev-token" {
 		t.Fatalf("default edit touched dev env: %q", got)
 	}
 }
@@ -1194,7 +1194,7 @@ EOF
 	if code != 0 {
 		t.Fatalf("get edited value failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if got := strings.TrimSpace(stdout); got != "API_TOKEN = new-token" {
+	if got := strings.TrimSpace(stdout); got != "new-token" {
 		t.Fatalf("unexpected edited value: %q", got)
 	}
 }
@@ -1667,7 +1667,7 @@ func TestUsersApproveRekeysAndPreservesUnaffectedValues(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("approved alice could not decrypt: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if got := strings.TrimSpace(stdout); got != "options.team.secret = team-secret" {
+	if got := strings.TrimSpace(stdout); got != "team-secret" {
 		t.Fatalf("unexpected alice get output: %q", got)
 	}
 }

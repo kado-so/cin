@@ -395,7 +395,7 @@ func newGetCommand(stdout io.Writer, filePath *string, localFile *string, noLoca
 				return fmt.Errorf("%s is plaintext, but all config values must be encrypted", key)
 			}
 			if !show {
-				fmt.Fprintf(stdout, "%s = [secret]\n", key)
+				fmt.Fprintln(stdout, "[secret]")
 				return nil
 			}
 
@@ -411,7 +411,7 @@ func newGetCommand(stdout io.Writer, filePath *string, localFile *string, noLoca
 			if !ok {
 				return missingValueError(doc, env, app, key)
 			}
-			fmt.Fprintf(stdout, "%s = %s\n", key, resolvedValue.Resolved)
+			fmt.Fprintln(stdout, resolvedValue.Resolved)
 			return nil
 		},
 	}
