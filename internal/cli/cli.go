@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -98,7 +99,7 @@ func NewRootCommand(stdout io.Writer, stderr io.Writer) *cobra.Command {
 	root.AddCommand(newSetCommand(&filePath))
 	root.AddCommand(newGetCommand(stdout, &filePath, &localFile, &noLocal, &user))
 	root.AddCommand(newRunCommand(stdout, stderr, &filePath, &localFile, &noLocal, &user))
-	root.AddCommand(newExportCommand(stdout, &filePath, &localFile, &noLocal, &user))
+	root.AddCommand(newExportCommand(stdout, stderr, &filePath, &localFile, &noLocal, &user))
 	root.AddCommand(newEditCommand(&filePath, &user))
 	root.AddCommand(newRenderCommand(stdout, &filePath, &localFile, &noLocal, &user))
 	root.AddCommand(newExplainCommand(stdout, &filePath, &localFile, &noLocal, &user))
@@ -451,12 +452,13 @@ func newRunCommand(stdout io.Writer, stderr io.Writer, filePath *string, localFi
 	return cmd
 }
 
-func newExportCommand(stdout io.Writer, filePath *string, localFile *string, noLocal *bool, user *string) *cobra.Command {
+func newExportCommand(stdout io.Writer, stderr io.Writer, filePath *string, localFile *string, noLocal *bool, user *string) *cobra.Command {
 	var env string
 	var app string
 	var format string
 	var out string
 	var yes bool
+	var toStdout bool
 
 	cmd := &cobra.Command{
 		Use:   "export -e <env> -a <app>",
@@ -466,8 +468,14 @@ func newExportCommand(stdout io.Writer, filePath *string, localFile *string, noL
 			if app == "" {
 				return errors.New("cin export requires -a <app>\nfix: rerun with -a api")
 			}
+			if out != "" && toStdout {
+				return errors.New("choose either --out or --stdout")
+			}
 			if out != "" && !yes {
 				return fmt.Errorf("refusing to write plaintext secrets to %s without confirmation\nfix: rerun with --yes", out)
+			}
+			if toStdout && !yes {
+				return errors.New("refusing to write plaintext secrets to stdout without confirmation\nfix: rerun with --stdout --yes")
 			}
 			envVars, err := resolvedAppEnv(*filePath, *localFile, *noLocal, *user, env, app)
 			if err != nil {
@@ -477,9 +485,12 @@ func newExportCommand(stdout io.Writer, filePath *string, localFile *string, noL
 			if err != nil {
 				return err
 			}
-			if out == "" {
+			if toStdout {
 				_, err = stdout.Write(data)
 				return err
+			}
+			if out == "" {
+				return pageSecret(data, cmd.InOrStdin(), stdout, stderr)
 			}
 			return writeSecretFile(out, data)
 		},
@@ -489,6 +500,7 @@ func newExportCommand(stdout io.Writer, filePath *string, localFile *string, noL
 	cmd.Flags().StringVar(&format, "format", "dotenv", "output format: dotenv or json")
 	cmd.Flags().StringVar(&out, "out", "", "write output to file")
 	cmd.Flags().BoolVar(&yes, "yes", false, "confirm plaintext file output")
+	cmd.Flags().BoolVar(&toStdout, "stdout", false, "write plaintext output to stdout")
 	return cmd
 }
 
@@ -839,6 +851,53 @@ func writeSecretFile(path string, data []byte) error {
 		return err
 	}
 	return os.Rename(tmpPath, path)
+}
+
+func pageSecret(data []byte, stdin io.Reader, stdout io.Writer, stderr io.Writer) error {
+	tmp, cleanup, err := secureTempFile("export-*")
+	if err != nil {
+		return err
+	}
+	path := tmp.Name()
+	defer cleanup()
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	pager := pagerCommand()
+	args := append(append([]string(nil), pager[1:]...), path)
+	cmd := exec.Command(pager[0], args...)
+	cmd.Stdin = stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	if err := cmd.Run(); err != nil {
+		return errors.New("failed to open export pager")
+	}
+	return nil
+}
+
+func pagerCommand() []string {
+	pager := os.Getenv("PAGER")
+	if pager == "" {
+		pager = defaultPager()
+	}
+	fields := strings.Fields(pager)
+	if len(fields) == 0 {
+		return []string{defaultPager()}
+	}
+	return fields
+}
+
+func defaultPager() string {
+	if runtime.GOOS == "windows" {
+		return "more"
+	}
+	return "less"
 }
 
 type editSession struct {

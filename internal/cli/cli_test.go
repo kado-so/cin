@@ -750,7 +750,7 @@ func TestExportDotenvToStdout(t *testing.T) {
 	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "DATABASE_URL", "postgres://db/app"})
 	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "token"})
 
-	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api"})
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--stdout", "--yes"})
 	if code != 0 {
 		t.Fatalf("export failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
@@ -770,7 +770,7 @@ func TestExportJSONToStdout(t *testing.T) {
 	runOK(t, []string{"-f", path, "init", "vaishnav"})
 	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "token"})
 
-	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--format", "json"})
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--format", "json", "--stdout", "--yes"})
 	if code != 0 {
 		t.Fatalf("export json failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
@@ -789,6 +789,93 @@ func TestExportRequiresApp(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "cin export requires -a <app>") {
 		t.Fatalf("expected app guidance, got %q", stderr)
+	}
+}
+
+func TestExportStdoutRequiresYesAndDoesNotLeakPlaintext(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "do-not-leak"})
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--stdout"})
+	if code != 2 {
+		t.Fatalf("expected stdout confirmation failure, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("expected no stdout, got %q", stdout)
+	}
+	if !strings.Contains(stderr, "refusing to write plaintext secrets to stdout") || !strings.Contains(stderr, "--stdout --yes") {
+		t.Fatalf("expected stdout confirmation guidance, got %q", stderr)
+	}
+	if strings.Contains(stdout, "do-not-leak") || strings.Contains(stderr, "do-not-leak") {
+		t.Fatalf("export error leaked plaintext: stdout=%q stderr=%q", stdout, stderr)
+	}
+}
+
+func TestExportDefaultUsesPagerAndCleansTemp(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	record := filepath.Join(t.TempDir(), "pager-path")
+	t.Setenv("PAGER_RECORD", record)
+	t.Setenv("PAGER", fakePager(t, `
+file_mode=$(stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1")
+dir_mode=$(stat -f %Lp "$(dirname "$1")" 2>/dev/null || stat -c %a "$(dirname "$1")")
+[ "$file_mode" = 600 ] || exit 7
+[ "$dir_mode" = 700 ] || exit 8
+grep -q '^API_TOKEN=token$' "$1" || exit 9
+printf '%s' "$1" > "$PAGER_RECORD"
+printf 'paged\n'
+`))
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "token"})
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api"})
+	if code != 0 {
+		t.Fatalf("export pager failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "paged\n" || stderr != "" {
+		t.Fatalf("expected pager output only, stdout=%q stderr=%q", stdout, stderr)
+	}
+	if strings.Contains(stdout, "token") || strings.Contains(stderr, "token") {
+		t.Fatalf("default export leaked plaintext outside pager: stdout=%q stderr=%q", stdout, stderr)
+	}
+	tempPathData, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("read pager temp path: %v", err)
+	}
+	tempDir := filepath.Dir(string(tempPathData))
+	if _, err := os.Stat(tempDir); !os.IsNotExist(err) {
+		t.Fatalf("expected pager temp dir cleanup, stat err=%v", err)
+	}
+}
+
+func TestExportPagerStartFailureDoesNotLeakPlaintext(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+	t.Setenv("PAGER", filepath.Join(t.TempDir(), "missing-pager"))
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "do-not-leak"})
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api"})
+	if code != 2 {
+		t.Fatalf("expected pager start failure, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("expected no stdout, got %q", stdout)
+	}
+	if !strings.Contains(stderr, "failed to open export pager") {
+		t.Fatalf("expected pager failure, got %q", stderr)
+	}
+	if strings.Contains(stdout, "do-not-leak") || strings.Contains(stderr, "do-not-leak") {
+		t.Fatalf("pager error leaked plaintext: stdout=%q stderr=%q", stdout, stderr)
 	}
 }
 
@@ -1747,6 +1834,15 @@ func fakeEditor(t *testing.T, script string) string {
 	path := filepath.Join(t.TempDir(), "editor.sh")
 	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script+"\n"), 0o700); err != nil {
 		t.Fatalf("write fake editor: %v", err)
+	}
+	return path
+}
+
+func fakePager(t *testing.T, script string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "pager.sh")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script+"\n"), 0o700); err != nil {
+		t.Fatalf("write fake pager: %v", err)
 	}
 	return path
 }
