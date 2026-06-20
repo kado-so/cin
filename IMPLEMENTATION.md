@@ -707,10 +707,10 @@ cin get -e dev options.postgres.host
 cin get -e dev -a api DATABASE_URL
 ```
 
-Default output is redacted:
+Default output is redacted and machine-friendly:
 
 ```text
-DATABASE_URL = [secret]
+[secret]
 ```
 
 Plaintext requires:
@@ -718,6 +718,10 @@ Plaintext requires:
 ```bash
 cin get -e dev -a api DATABASE_URL --show
 ```
+
+With `--show`, `get` prints only the resolved value and a trailing newline. It
+must not print the key name, source path, recipient set, provenance, or any other
+metadata. Use `cin explain` for context.
 
 ### Run
 
@@ -746,18 +750,16 @@ Secrets are passed as environment variables, not command-line arguments.
 cin render -e dev -a api
 ```
 
-Shows the resolved selected app config, redacted by default.
+Shows a redacted preview of the resolved selected app config. `render` is for
+inspection and debugging; it should not be used to materialize plaintext secrets
+for another process.
 
 ```text
 DATABASE_URL=[secret template resolved]
 REDIS_URL=[secret]
 ```
 
-Plaintext requires:
-
-```bash
-cin render -e dev -a api --show
-```
+Plaintext materialization belongs to `cin export`, not `cin render`.
 
 ### Explain
 
@@ -791,6 +793,9 @@ Rules:
 - Requires `-a`.
 - Writes plaintext only with explicit confirmation.
 - `--yes` is required for non-interactive file export.
+- `--yes` and an explicit stdout flag are required for stdout export.
+- If neither `--out` nor the explicit stdout flag is provided, open the export in
+  a local pager instead of writing plaintext into the terminal scrollback.
 - Temporary files use restrictive permissions.
 
 ### Users
@@ -1348,6 +1353,119 @@ Golden tests should assert that unrelated encrypted values are byte-identical.
 - Make schema diagnostics aggregate multiple validation failures in stable order.
 - Add golden-output tests for doctor categories, severity ordering, fixes, and
   redaction.
+
+### Broaden `cin edit` scope
+
+- Change `cin edit` so `-a` is optional.
+- Support `cin edit` with no flags. It should resolve the default env using the
+  normal env default order and open all decryptable env data for that env.
+- Support `cin edit -e <env>` without `-a`. It should open all decryptable
+  options and app values for the selected env.
+- Keep `cin edit -e <env> -a <app>` as the focused app-editing workflow.
+- Preserve the current safety model: secure temp dir/file permissions, cleanup
+  on signal, structured YAML parsing, unknown-key rejection, template/schema
+  validation before save, and unchanged ciphertext preservation.
+- Do not expose or edit `cin` metadata through broad edit mode. User, recipient,
+  schema, and defaults metadata should continue to be managed by purpose-built
+  commands or direct file review.
+- Omit values the current user cannot decrypt and make that omission explicit in
+  the editor document without printing plaintext.
+- In broad env mode, include env-level `options` and every app's `values`.
+- In default `cin edit` mode, use explicit `-e`, then `cin.defaults.env`, then
+  `dev`; do not edit every environment by default.
+- Add tests for no-flag edit, env-wide edit, app-focused edit, undecryptable
+  value omission, unknown app/value rejection, unchanged ciphertext
+  preservation, and schema/template validation failures.
+
+### Local `.env` loading
+
+- Add support for loading CLI environment defaults from a local `.env` file.
+- The loader should populate missing process environment variables only; real
+  process environment variables must win over `.env` values.
+- Use this for `CIN_USER`, `CIN_AGE_KEY`, `CIN_AGE_KEY_FILE`, and future
+  `CIN_*` runtime settings.
+- Discovery order:
+  1. `.env` in the current working directory.
+  2. `.env` at the Git repository root, when the current directory is inside a
+     Git repository.
+- If both files exist, the current working directory `.env` has highest
+  precedence.
+- Do not invoke the `git` shell command for repository discovery. Use a Go
+  binding/library or direct `.git` directory discovery logic that handles normal
+  repos and worktrees.
+- `.env` loading must not print loaded secrets or include secret values in
+  errors.
+- Parse simple dotenv syntax: `KEY=value`, optional `export KEY=value`, quoted
+  values, blank lines, and comments.
+- Invalid `.env` syntax should produce a clear non-secret error naming the file
+  and line.
+- Add tests for current-directory discovery, Git-root discovery, precedence,
+  process-env override behavior, worktree/root detection, quoted values,
+  comments, invalid syntax, and redaction.
+
+### Guard plaintext export output
+
+- Change `cin export` so plaintext never goes to stdout by default.
+- File export must continue to require `--out <path> --yes`.
+- Stdout export must require both `--stdout` and `--yes`.
+- If no destination is provided, open the generated export in a local pager
+  instead of writing it to stdout.
+- Pager selection should use `$PAGER` when set, then fall back to a sensible
+  platform default such as `less` on Unix-like systems and `more` on Windows.
+- Do not invoke a shell to launch the pager. Execute the pager binary directly.
+- Do not include secret values in errors if the pager cannot be started.
+- Keep temporary pager input files restricted to mode `0600` inside a `0700`
+  temp directory and clean them up on exit and signals.
+- Add tests for refused stdout without `--stdout --yes`, refused file output
+  without `--yes`, pager default behavior, pager temp-file permissions, cleanup,
+  and redaction of pager-start failures.
+
+### Tighten `cin get` output
+
+- Change `cin get` output so it prints only the value payload.
+- Without `--show`, print only `[secret]` and a trailing newline.
+- With `--show`, print only the resolved plaintext value and a trailing newline.
+- Do not print `KEY = ...`, source paths, recipient metadata, provenance, or
+  diagnostics in successful `get` output.
+- Keep all explanatory output in errors or `cin explain`.
+- Add tests that `get`, `get --show`, option gets, and app-value gets are
+  machine-friendly single-value outputs.
+
+### Explain override provenance
+
+- Extend `cin explain` to show the override and inheritance chain for the
+  requested value.
+- Include each layer that contributed to the final resolved value, such as parent
+  envs, the selected env, and local override data.
+- For template references, show whether each referenced value came from a parent,
+  selected env, or local override.
+- Keep all values redacted.
+- Show overridden locations without printing the overridden plaintext values.
+- Add tests for parent env overrides, rightmost-parent precedence, selected-env
+  overrides, local override precedence, and template reference provenance.
+
+### Merge `cin render` into `cin export --redact-values`
+
+- Remove `cin render` as a separate command, or deprecate it as an alias during a
+  short transition.
+- Add `cin export --redact-values`.
+- With `--redact-values`, `export` should resolve the selected env/app and emit
+  the same output shape as a normal export, but replace every value with a
+  redacted marker.
+- `--redact-values` output is not plaintext and does not require `--yes`.
+- `--redact-values` may be written to stdout without `--stdout --yes` because it
+  contains no secrets.
+- Keep `cin export` without `--redact-values` under the strict plaintext guards:
+  file output requires `--out --yes`, stdout requires `--stdout --yes`, and no
+  explicit destination opens the local pager.
+- Preserve format support. For example, dotenv output should look like
+  `DATABASE_URL=[secret]`, and JSON output should contain redacted string
+  values.
+- `cin get` remains one-value only.
+- `cin explain` remains the provenance/dependency command.
+- Add tests that `export --redact-values` never prints plaintext, supports dotenv
+  and JSON formats, does not require `--yes`, and matches the resolved key set
+  that plaintext export would include.
 
 ## Open implementation notes
 
