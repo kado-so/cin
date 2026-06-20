@@ -1303,6 +1303,52 @@ Maintain fixtures for deterministic YAML output:
 
 Golden tests should assert that unrelated encrypted values are byte-identical.
 
+## Remaining implementation tasks
+
+### `cin edit`
+
+- Implement `cin edit -e <env> -a <app>` as an explicit plaintext editing
+  workflow.
+- Reuse the existing secure temp-file helpers: temp dir mode `0700`, temp file
+  mode `0600`, cleanup on normal exit, error, SIGINT, and SIGTERM.
+- Open `$VISUAL`, then `$EDITOR`, and fail with a clear error if neither is set.
+- Render only the selected app values plus referenced options needed for that
+  edit session.
+- Redact or omit values the current user cannot decrypt.
+- After editor exit, parse the edited document with a structured parser.
+- Re-encrypt only changed values and preserve unchanged encrypted scalars
+  byte-identical.
+- Reject plaintext writes outside the temp file.
+- Validate the edited result with schema and template checks before saving.
+- Add tests for temp-file permissions, cleanup, unchanged-value preservation,
+  schema failure, malformed edit input, and editor cancellation.
+
+### `-e` defaults and fixes
+
+- Implement env default resolution for commands that take `-e`.
+- Resolution order: explicit `-e`, then `cin.defaults.env`, then `dev`.
+- Keep `cin run` and `cin export` requiring `-a`.
+- Make error messages name the resolved/defaulted env when a value/app is
+  missing.
+- Ensure local override loading uses the resolved env, not the raw flag value.
+- Add tests for explicit env, `cin.defaults.env`, fallback `dev`, missing env,
+  and local override behavior with a defaulted env.
+
+### Doctor hardening
+
+- Expand `cin doctor` from MVP diagnostics to full spec coverage.
+- Add standalone cross-env key consistency checks, separate from JSON Schema.
+- Improve template diagnostics so missing refs, cycles, unsupported actions, and
+  unknown app references produce purpose-built messages and fixes.
+- Report when decrypt-dependent checks were skipped because no current user or
+  identity was available.
+- Check that local override files contain only `envs` data, not just selected
+  known `cin` metadata keys.
+- Add recipient-set access impact warnings for unusually broad approvals.
+- Make schema diagnostics aggregate multiple validation failures in stable order.
+- Add golden-output tests for doctor categories, severity ordering, fixes, and
+  redaction.
+
 ## Open implementation notes
 
 - Approval metadata is not a cryptographic signature. If cryptographic signing is
