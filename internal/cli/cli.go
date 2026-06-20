@@ -36,6 +36,14 @@ import (
 
 const version = "0.0.0-dev"
 
+const (
+	groupProject     = "project"
+	groupConfig      = "config"
+	groupRuntime     = "runtime"
+	groupUsers       = "users"
+	groupDiagnostics = "diagnostics"
+)
+
 func Run(args []string, stdout io.Writer, stderr io.Writer) int {
 	cmd := NewRootCommand(stdout, stderr)
 	cmd.SetArgs(args)
@@ -60,8 +68,28 @@ func NewRootCommand(stdout io.Writer, stderr io.Writer) *cobra.Command {
 	var user string
 
 	root := &cobra.Command{
-		Use:           "cin",
-		Short:         "Encrypt app config in Git and inject it at runtime.",
+		Use:   "cin",
+		Short: "Encrypt app config in Git and inject it at runtime.",
+		Long:  "cin (config inject) encrypts config in Git and injects resolved values at runtime.",
+		Example: `  # Create configs.secret.yaml at the repo root
+  cin init vaishnav
+
+  # Set, read, and edit root config
+  cin set -e dev options.postgres.host postgres
+  cin get -e dev options.postgres.host
+  cin edit -e dev
+
+  # Set and run app config
+  cin set -e dev -a api DATABASE_URL 'postgres://{{ .options.postgres.host }}/api'
+  cin run -e dev -a api -- pnpm dev
+
+  # Manage users
+  cin users create alice
+  cin users list
+  cin users approve alice
+
+  # Check config health
+  cin doctor -e dev -a api`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
@@ -86,24 +114,42 @@ func NewRootCommand(stdout io.Writer, stderr io.Writer) *cobra.Command {
 	root.PersistentFlags().StringVar(&user, "user", "", "current cin user")
 	root.Flags().BoolVarP(&showVersion, "version", "v", false, "show the cin version")
 
-	root.AddCommand(&cobra.Command{
-		Use:   "version",
-		Short: "Show the cin version",
-		Args:  cobra.NoArgs,
+	versionCmd := &cobra.Command{
+		Use:     "version",
+		Short:   "Show the cin version",
+		GroupID: groupDiagnostics,
+		Args:    cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			fmt.Fprintln(stdout, version)
 		},
-	})
+	}
+	initCmd := newInitCommand(stdout, &filePath)
+	initCmd.GroupID = groupProject
+	setCmd := newSetCommand(&filePath)
+	setCmd.GroupID = groupConfig
+	getCmd := newGetCommand(stdout, &filePath, &localFile, &noLocal, &user)
+	getCmd.GroupID = groupConfig
+	editCmd := newEditCommand(&filePath, &user)
+	editCmd.GroupID = groupConfig
+	explainCmd := newExplainCommand(stdout, &filePath, &localFile, &noLocal, &user)
+	explainCmd.GroupID = groupConfig
+	runCmd := newRunCommand(stdout, stderr, &filePath, &localFile, &noLocal, &user)
+	runCmd.GroupID = groupRuntime
+	exportCmd := newExportCommand(stdout, stderr, &filePath, &localFile, &noLocal, &user)
+	exportCmd.GroupID = groupRuntime
+	usersCmd := newUsersCommand(stdout, stderr, &filePath, &user)
+	usersCmd.GroupID = groupUsers
+	doctorCmd := newDoctorCommand(stdout, &filePath, &localFile, &noLocal, &user)
+	doctorCmd.GroupID = groupDiagnostics
 
-	root.AddCommand(newInitCommand(stdout, &filePath))
-	root.AddCommand(newSetCommand(&filePath))
-	root.AddCommand(newGetCommand(stdout, &filePath, &localFile, &noLocal, &user))
-	root.AddCommand(newRunCommand(stdout, stderr, &filePath, &localFile, &noLocal, &user))
-	root.AddCommand(newExportCommand(stdout, stderr, &filePath, &localFile, &noLocal, &user))
-	root.AddCommand(newEditCommand(&filePath, &user))
-	root.AddCommand(newExplainCommand(stdout, &filePath, &localFile, &noLocal, &user))
-	root.AddCommand(newUsersCommand(stdout, stderr, &filePath, &user))
-	root.AddCommand(newDoctorCommand(stdout, &filePath, &localFile, &noLocal, &user))
+	root.AddGroup(
+		&cobra.Group{ID: groupProject, Title: "Project commands"},
+		&cobra.Group{ID: groupConfig, Title: "Config commands"},
+		&cobra.Group{ID: groupRuntime, Title: "Runtime commands"},
+		&cobra.Group{ID: groupUsers, Title: "User commands"},
+		&cobra.Group{ID: groupDiagnostics, Title: "Diagnostics commands"},
+	)
+	root.AddCommand(initCmd, setCmd, getCmd, editCmd, explainCmd, runCmd, exportCmd, usersCmd, doctorCmd, versionCmd)
 
 	return root
 }
@@ -137,8 +183,13 @@ func newInitCommand(stdout io.Writer, filePath *string) *cobra.Command {
 
 func newUsersCommand(stdout io.Writer, stderr io.Writer, filePath *string, user *string) *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "users",
-		Short: "Manage cin users",
+		Use:     "users",
+		Aliases: []string{"user"},
+		Short:   "Manage cin users",
+		Example: `  cin users create alice
+  cin users list
+  cin users approve alice
+  cin users remove alice`,
 	}
 	cmd.AddCommand(newUsersAddCommand(stdout, filePath))
 	cmd.AddCommand(newUsersListCommand(stdout, filePath))
@@ -150,9 +201,10 @@ func newUsersCommand(stdout io.Writer, stderr io.Writer, filePath *string, user 
 func newUsersAddCommand(stdout io.Writer, filePath *string) *cobra.Command {
 	var publicKey string
 	cmd := &cobra.Command{
-		Use:   "add <username>",
-		Short: "Add a pending user",
-		Args:  cobra.ExactArgs(1),
+		Use:     "create <username>",
+		Aliases: []string{"add"},
+		Short:   "Create a pending user",
+		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			doc, err := loadConfig(*filePath)
 			if err != nil {

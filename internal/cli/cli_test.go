@@ -27,6 +27,16 @@ func TestRunHelp(t *testing.T) {
 	if stdout.Len() == 0 {
 		t.Fatal("expected help output")
 	}
+	for _, want := range []string{
+		"Config commands",
+		"User commands",
+		"cin set -e dev options.postgres.host postgres",
+		"cin users create alice",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Fatalf("help output missing %q: %q", want, stdout.String())
+		}
+	}
 	if stderr.Len() != 0 {
 		t.Fatalf("expected no stderr, got %q", stderr.String())
 	}

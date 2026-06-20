@@ -1,9 +1,9 @@
 # cin implementation design
 
-`cin` is a serverless CLI for encrypted application config and secret injection.
-It stores all configuration in Git as encrypted YAML and injects resolved values
-into child processes at runtime. There is no daemon, hosted vault, API server, or
-external control plane.
+`cin` means config inject. It is a serverless CLI for encrypted application
+config and secret injection. It stores all configuration in Git as encrypted
+YAML and injects resolved values into child processes at runtime. There is no
+daemon, hosted vault, API server, or external control plane.
 
 This document is the implementation contract for the first Go version.
 
@@ -65,7 +65,7 @@ template.
 CI gets its own age identity and is approved like any other user.
 
 ```bash
-cin users add ci-prod
+cin users create ci-prod
 cin users approve ci-prod
 ```
 
@@ -84,7 +84,7 @@ GitHub Actions:
 A new user is pending until an existing authorized user approves them.
 
 ```bash
-cin users add alice
+cin users create alice
 cin users approve alice
 ```
 
@@ -447,10 +447,10 @@ values are written.
 
 ## User lifecycle
 
-### Add
+### Create
 
 ```bash
-cin users add alice
+cin users create alice
 ```
 
 Behavior:
@@ -786,7 +786,7 @@ Rules:
 ### Users
 
 ```bash
-cin users add <username>
+cin users create <username>
 cin users approve <username>
 cin users list
 cin users remove <username>
@@ -949,7 +949,7 @@ Users
 
 Recipients
   error recipient set prod references unknown user ci-prod
-    fix: cin users add ci-prod
+    fix: cin users create ci-prod
 
 Schemas
   error apps/api/cin.schema.yaml requires REDIS_URL, but dev/api does not define it
@@ -1340,7 +1340,7 @@ command path at a time.
 - `cin run` injects values into child process.
 - `cin run` requires `-a`.
 - Local override file changes resolved export output.
-- `users add` creates pending user.
+- `users create` creates pending user.
 - `users approve` rekeys after typed approval.
 - `users remove` rekeys and blocks removed user's key.
 - `doctor` catches plaintext values.
