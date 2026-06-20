@@ -24,6 +24,7 @@ import (
 	"cin/internal/cryptoage"
 	"cin/internal/doctor"
 	"cin/internal/envelope"
+	"cin/internal/localenv"
 	"cin/internal/resolve"
 	cinschema "cin/internal/schema"
 	"filippo.io/age"
@@ -62,6 +63,9 @@ func NewRootCommand(stdout io.Writer, stderr io.Writer) *cobra.Command {
 		Short:         "Encrypt app config in Git and inject it at runtime.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			return localenv.Load()
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if showVersion {
 				fmt.Fprintln(stdout, version)

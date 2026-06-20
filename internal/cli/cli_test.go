@@ -270,6 +270,28 @@ func TestEnvDefaultResolutionMissingAppNamesResolvedDefault(t *testing.T) {
 	}
 }
 
+func TestRunLoadsLocalDotenvForCinRuntimeSettings(t *testing.T) {
+	identity := testIdentity(t)
+	dir := t.TempDir()
+	chdir(t, dir)
+	restoreEnv(t, "CIN_USER", "CIN_AGE_KEY")
+	unsetEnv(t, "CIN_USER", "CIN_AGE_KEY")
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("CIN_USER=vaishnav\nCIN_AGE_KEY="+identity.String()+"\n"), 0o600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+
+	runOK(t, []string{"init", "vaishnav"})
+	runOK(t, []string{"set", "-e", "dev", "options.postgres.host", "postgres"})
+
+	stdout, stderr, code := runCLI([]string{"get", "-e", "dev", "options.postgres.host", "--show"})
+	if code != 0 {
+		t.Fatalf("get using .env settings failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if got := strings.TrimSpace(stdout); got != "options.postgres.host = postgres" {
+		t.Fatalf("expected decrypted value using .env settings, got %q", got)
+	}
+}
+
 func TestEnvDefaultResolutionLoadsLocalOverrideForDefaultedEnv(t *testing.T) {
 	identity := testIdentity(t)
 	t.Setenv("CIN_AGE_KEY", identity.String())
@@ -1645,6 +1667,37 @@ func chdir(t *testing.T, dir string) {
 			t.Fatalf("restore cwd: %v", err)
 		}
 	})
+}
+
+func restoreEnv(t *testing.T, keys ...string) {
+	t.Helper()
+	type savedValue struct {
+		value string
+		ok    bool
+	}
+	saved := map[string]savedValue{}
+	for _, key := range keys {
+		value, ok := os.LookupEnv(key)
+		saved[key] = savedValue{value: value, ok: ok}
+	}
+	t.Cleanup(func() {
+		for _, key := range keys {
+			if saved[key].ok {
+				_ = os.Setenv(key, saved[key].value)
+			} else {
+				_ = os.Unsetenv(key)
+			}
+		}
+	})
+}
+
+func unsetEnv(t *testing.T, keys ...string) {
+	t.Helper()
+	for _, key := range keys {
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatalf("unset %s: %v", key, err)
+		}
+	}
 }
 
 func runOK(t *testing.T, args []string) string {
