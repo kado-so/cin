@@ -159,6 +159,31 @@ func (d *Document) SetScalar(path []string, value string) error {
 	return nil
 }
 
+func (d *Document) SetNode(path []string, value *yaml.Node) error {
+	parent := d.ensureMap(path[:len(path)-1])
+	setMap(parent, path[len(path)-1], cloneNode(value))
+	return nil
+}
+
+func (d *Document) ReplaceRoot(value *yaml.Node) {
+	d.root.Content = []*yaml.Node{cloneNode(value)}
+}
+
+func (d *Document) DeletePath(path []string) {
+	if len(path) == 0 {
+		return
+	}
+	parent := d.lookup(path[:len(path)-1])
+	if parent == nil || parent.Kind != yaml.MappingNode {
+		return
+	}
+	deleteMap(parent, path[len(path)-1])
+}
+
+func (d *Document) CloneNode(path []string) *yaml.Node {
+	return cloneNode(d.lookup(path))
+}
+
 func (d *Document) GetScalar(path []string) (string, bool) {
 	node := d.lookup(path)
 	if node == nil || node.Kind != yaml.ScalarNode {

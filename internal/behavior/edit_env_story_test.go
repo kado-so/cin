@@ -1,9 +1,9 @@
-// Story: a developer edits an environment as a whole, including shared options
-// and app values, without naming one app at a time.
+// Story: a developer edits one environment or the whole config, including new
+// values, without naming one app at a time.
 //
 // Protects: env-wide edit must decrypt only editable values into the temporary
-// document, re-encrypt changed values, preserve untouched ciphertext, reject
-// unsafe edits without saving, and never write edited plaintext to config.
+// document, re-encrypt changed values, preserve untouched ciphertext, and never
+// write edited plaintext to config.
 package behavior
 
 import (
@@ -27,7 +27,7 @@ func TestEditEnvStory(t *testing.T) {
 		"prod-token-old", "prod-token-new",
 		"prod-queue-old", "prod-queue-new",
 		"prod-worker-keep",
-		"should-not-save",
+		"extra-value",
 	}
 
 	story.OK(story.RunAs("vaishnav", "init", "vaishnav"))
@@ -94,34 +94,24 @@ EOF
 	t.Setenv("VISUAL", storyFakeEditor(t, `grep -q 'prod-db-old' "$1" || exit 1
 grep -q 'prod-token-old' "$1" || exit 1
 grep -q 'prod-queue-old' "$1" || exit 1
-grep -q 'dev-token-new' "$1" && exit 1
-cat > "$1" <<'EOF'
-options:
-  postgres:
-    host: prod-db-new
-apps:
-  api:
-    values:
-      API_TOKEN: prod-token-new
-  worker:
-    values:
-      QUEUE: prod-queue-new
-      UNCHANGED: prod-worker-keep
-EOF
+grep -q 'dev-token-new' "$1" || exit 1
+grep -q '^cin:' "$1" || exit 1
+tmp="$1.tmp"
+sed 's/prod-db-old/prod-db-new/g; s/prod-token-old/prod-token-new/g; s/prod-queue-old/prod-queue-new/g' "$1" > "$tmp" && mv "$tmp" "$1"
 `))
 
 	story.OK(story.RunAs("vaishnav", "edit"))
 	if got := storyEncryptedScalar(t, story.ConfigPath, "envs", "prod", "apps", "worker", "values", "UNCHANGED"); got != prodUnchangedBefore {
-		t.Fatal("unchanged default-env value was not preserved byte-identical")
+		t.Fatal("unchanged whole-config edit value was not preserved byte-identical")
 	}
 
 	prodHost := story.OK(story.RunAs("vaishnav", "get", "-e", "prod", "options.postgres.host", "--show"))
 	if prodHost.Stdout != "prod-db-new\n" {
-		t.Fatalf("unexpected edited default env option: %q", prodHost.Stdout)
+		t.Fatalf("unexpected edited whole-config option: %q", prodHost.Stdout)
 	}
 	prodAPI := story.OK(story.RunAs("vaishnav", "get", "-e", "prod", "-a", "api", "API_TOKEN", "--show"))
 	if prodAPI.Stdout != "prod-token-new\n" {
-		t.Fatalf("unexpected edited default env app value: %q", prodAPI.Stdout)
+		t.Fatalf("unexpected edited whole-config app value: %q", prodAPI.Stdout)
 	}
 	prodWorkerExport := story.OK(story.RunAs("vaishnav", "export", "-e", "prod", "-a", "worker", "--stdout", "--yes"))
 	for _, want := range []string{"QUEUE=prod-queue-new", "UNCHANGED=prod-worker-keep"} {
@@ -131,17 +121,16 @@ EOF
 	}
 	devStillEdited := story.OK(story.RunAs("vaishnav", "get", "-e", "dev", "-a", "api", "API_TOKEN", "--show"))
 	if devStillEdited.Stdout != "dev-token-new\n" {
-		t.Fatalf("default-env edit touched dev env: %q", devStillEdited.Stdout)
+		t.Fatalf("whole-config edit changed dev env unexpectedly: %q", devStillEdited.Stdout)
 	}
 	story.AssertNoPlaintext(story.ReadConfig(), secrets...)
 
-	tokenBeforeRejectedEdit := storyEncryptedScalar(t, story.ConfigPath, "envs", "dev", "apps", "api", "values", "API_TOKEN")
 	t.Setenv("VISUAL", storyFakeEditor(t, `cat > "$1" <<'EOF'
 apps:
   api:
     values:
-      API_TOKEN: should-not-save
-      EXTRA: no
+      API_TOKEN: dev-token-new
+      EXTRA: extra-value
   worker:
     values:
       QUEUE: dev-worker-keep
@@ -151,15 +140,13 @@ options:
 EOF
 `))
 
-	rejected := story.RunAs("vaishnav", "edit", "-e", "dev")
-	if rejected.Code != 2 {
-		t.Fatalf("expected unknown-key edit failure, got code=%d stdout=%q stderr=%q", rejected.Code, rejected.Stdout, rejected.Stderr)
+	added := story.OK(story.RunAs("vaishnav", "edit", "-e", "dev"))
+	if added.Stdout != "" || added.Stderr != "" {
+		t.Fatalf("expected quiet add-value edit, stdout=%q stderr=%q", added.Stdout, added.Stderr)
 	}
-	if rejected.Stdout != "" || !strings.Contains(rejected.Stderr, "unknown editable key: apps.api.values.EXTRA") {
-		t.Fatalf("unexpected unknown-key failure: stdout=%q stderr=%q", rejected.Stdout, rejected.Stderr)
-	}
-	if got := storyEncryptedScalar(t, story.ConfigPath, "envs", "dev", "apps", "api", "values", "API_TOKEN"); got != tokenBeforeRejectedEdit {
-		t.Fatal("unknown-key edit saved a changed value")
+	extra := story.OK(story.RunAs("vaishnav", "get", "-e", "dev", "-a", "api", "EXTRA", "--show"))
+	if extra.Stdout != "extra-value\n" {
+		t.Fatalf("unexpected added value: %q", extra.Stdout)
 	}
 	story.AssertNoPlaintext(story.ReadConfig(), secrets...)
 }

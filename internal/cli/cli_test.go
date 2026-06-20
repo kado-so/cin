@@ -151,6 +151,114 @@ func TestSetTemplateAndPreservesUnrelatedEncryptedValue(t *testing.T) {
 	}
 }
 
+func TestSetRequiresEnvForWrites(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+
+	_, stderr, code := runCLI([]string{"-f", path, "set", "-a", "api", "API_TOKEN", "token"})
+	if code != 2 {
+		t.Fatalf("expected missing env failure, got code=%d stderr=%q", code, stderr)
+	}
+	if !strings.Contains(stderr, "environment is required") {
+		t.Fatalf("expected env error, got %q", stderr)
+	}
+}
+
+func TestSetUsesNamedYamlPathAndEncryptsOnlySecretPaths(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "staging", "extends", "base"})
+	runOK(t, []string{"-f", path, "set", "-e", "staging", "defaults.recipientSet", "team"})
+	runOK(t, []string{"-f", path, "set", "-e", "staging", "apps.api.values.API_TOKEN", "token"})
+
+	doc, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if got, _ := doc.GetScalar([]string{"envs", "staging", "extends"}); got != "base" {
+		t.Fatalf("expected plaintext extends, got %q", got)
+	}
+	if got, _ := doc.GetScalar([]string{"envs", "staging", "defaults", "recipientSet"}); got != "team" {
+		t.Fatalf("expected plaintext recipient set default, got %q", got)
+	}
+	raw, ok := doc.GetScalar([]string{"envs", "staging", "apps", "api", "values", "API_TOKEN"})
+	if !ok {
+		t.Fatal("expected app value")
+	}
+	if _, err := envelope.Parse(raw); err != nil {
+		t.Fatalf("expected encrypted app value: %v", err)
+	}
+	stdout, stderr, code := runCLI([]string{"-f", path, "get", "-e", "staging", "extends"})
+	if code != 0 {
+		t.Fatalf("get metadata failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "base\n" {
+		t.Fatalf("unexpected metadata get: %q", stdout)
+	}
+	stdout, stderr, code = runCLI([]string{"-f", path, "explain", "-e", "staging", "extends"})
+	if code != 0 {
+		t.Fatalf("explain metadata failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	for _, want := range []string{"kind: plaintext", "value: base"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected metadata explain to contain %q, got %q", want, stdout)
+		}
+	}
+}
+
+func TestSetRejectsRecipientSetForMetadata(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+
+	_, stderr, code := runCLI([]string{"-f", path, "set", "-e", "dev", "extends", "base", "--recipient-set", "team"})
+	if code != 2 {
+		t.Fatalf("expected recipient-set metadata failure, got code=%d stderr=%q", code, stderr)
+	}
+	if !strings.Contains(stderr, "--recipient-set only applies to secret values") {
+		t.Fatalf("expected recipient-set error, got %q", stderr)
+	}
+}
+
+func TestSetPreservesRecipientSetForDirectPathAndShortcutOverwrites(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	addRecipientSet(t, path, "prod", "vaishnav")
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "apps.api.values.DIRECT", "old", "--recipient-set", "prod"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "apps.api.values.DIRECT", "new"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "SHORTCUT", "old", "--recipient-set", "prod"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "SHORTCUT", "new"})
+
+	doc, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	for _, key := range []string{"DIRECT", "SHORTCUT"} {
+		raw, ok := doc.GetScalar([]string{"envs", "dev", "apps", "api", "values", key})
+		if !ok {
+			t.Fatalf("missing %s", key)
+		}
+		enc, err := envelope.Parse(raw)
+		if err != nil {
+			t.Fatalf("parse %s: %v", key, err)
+		}
+		if enc.RecipientSet != "prod" {
+			t.Fatalf("expected %s to preserve prod recipient set, got %q", key, enc.RecipientSet)
+		}
+	}
+}
+
 func TestGetAppliesLocalOverrideAtHighestPrecedence(t *testing.T) {
 	identity := testIdentity(t)
 	t.Setenv("CIN_AGE_KEY", identity.String())
@@ -217,7 +325,7 @@ func TestEnvDefaultResolutionUsesCinDefaultEnv(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
 	runOK(t, []string{"-f", path, "init", "vaishnav"})
 	setDefaultEnv(t, path, "prod")
-	runOK(t, []string{"-f", path, "set", "-a", "api", "API_TOKEN", "prod-token"})
+	runOK(t, []string{"-f", path, "set", "-e", "prod", "-a", "api", "API_TOKEN", "prod-token"})
 
 	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "get", "-a", "api", "API_TOKEN", "--show"})
 	if code != 0 {
@@ -234,7 +342,7 @@ func TestEnvDefaultResolutionFallsBackToDev(t *testing.T) {
 
 	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
 	runOK(t, []string{"-f", path, "init", "vaishnav"})
-	runOK(t, []string{"-f", path, "set", "-a", "api", "API_TOKEN", "dev-token"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "dev-token"})
 
 	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "get", "-a", "api", "API_TOKEN", "--show"})
 	if code != 0 {
@@ -1272,7 +1380,7 @@ EOF
 	}
 }
 
-func TestEditCanChangeReferencedOption(t *testing.T) {
+func TestEnvEditCanChangeOptionAndAppValue(t *testing.T) {
 	identity := testIdentity(t)
 	t.Setenv("CIN_AGE_KEY", identity.String())
 
@@ -1282,16 +1390,18 @@ func TestEditCanChangeReferencedOption(t *testing.T) {
 	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "DATABASE_URL", "postgres://{{ .options.postgres.host }}/api"})
 
 	t.Setenv("VISUAL", fakeEditor(t, `cat > "$1" <<'EOF'
-values:
-  DATABASE_URL: postgres://{{ .options.postgres.host }}/api
 options:
   postgres:
     host: db-new
+apps:
+  api:
+    values:
+      DATABASE_URL: postgres://{{ .options.postgres.host }}/api
 EOF
 `))
 	t.Setenv("EDITOR", "")
 
-	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "edit", "-e", "dev", "-a", "api"})
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "edit", "-e", "dev"})
 	if code != 0 {
 		t.Fatalf("edit option failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
@@ -1304,7 +1414,7 @@ EOF
 	}
 }
 
-func TestEditWithoutFlagsUsesDefaultEnvAndEditsEnvWideValues(t *testing.T) {
+func TestEditWithoutFlagsEditsAllEnvs(t *testing.T) {
 	identity := testIdentity(t)
 	t.Setenv("CIN_AGE_KEY", identity.String())
 
@@ -1318,19 +1428,10 @@ func TestEditWithoutFlagsUsesDefaultEnvAndEditsEnvWideValues(t *testing.T) {
 	runOK(t, []string{"-f", path, "set", "-e", "prod", "-a", "worker", "UNCHANGED", "keep-me"})
 	unchangedBefore := encryptedScalar(t, path, []string{"envs", "prod", "apps", "worker", "values", "UNCHANGED"})
 
-	t.Setenv("VISUAL", fakeEditor(t, `cat > "$1" <<'EOF'
-options:
-  postgres:
-    host: db-new
-apps:
-  api:
-    values:
-      API_TOKEN: new-token
-  worker:
-    values:
-      QUEUE: new-queue
-      UNCHANGED: keep-me
-EOF
+	t.Setenv("VISUAL", fakeEditor(t, `grep -q '^cin:' "$1" || exit 1
+grep -q 'recipientSets:' "$1" || exit 1
+tmp="$1.tmp"
+sed 's/db-old/db-new/g; s/old-token/new-token/g; s/old-queue/new-queue/g' "$1" > "$tmp" && mv "$tmp" "$1"
 `))
 	t.Setenv("EDITOR", "")
 
@@ -1368,7 +1469,7 @@ EOF
 		t.Fatalf("get dev value failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 	if got := strings.TrimSpace(stdout); got != "dev-token" {
-		t.Fatalf("default edit touched dev env: %q", got)
+		t.Fatalf("whole-config edit changed dev env unexpectedly: %q", got)
 	}
 }
 
@@ -1414,15 +1515,13 @@ EOF
 	}
 }
 
-func TestEditEnvWideRejectsUnknownAppValueWithoutSaving(t *testing.T) {
+func TestEditEnvWideAllowsNewAppValue(t *testing.T) {
 	identity := testIdentity(t)
 	t.Setenv("CIN_AGE_KEY", identity.String())
 
 	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
 	runOK(t, []string{"-f", path, "init", "vaishnav"})
 	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "old-token"})
-	before := encryptedScalar(t, path, []string{"envs", "dev", "apps", "api", "values", "API_TOKEN"})
-
 	t.Setenv("VISUAL", fakeEditor(t, `cat > "$1" <<'EOF'
 apps:
   api:
@@ -1434,14 +1533,170 @@ EOF
 	t.Setenv("EDITOR", "")
 
 	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "edit", "-e", "dev"})
-	if code != 2 {
-		t.Fatalf("expected unknown value failure, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	if code != 0 {
+		t.Fatalf("edit failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if !strings.Contains(stderr, "unknown editable key: apps.api.values.EXTRA") {
-		t.Fatalf("expected unknown value error, got %q", stderr)
+	stdout, stderr, code = runCLI([]string{"-f", path, "--user", "vaishnav", "get", "-e", "dev", "-a", "api", "EXTRA", "--show"})
+	if code != 0 {
+		t.Fatalf("get new value failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
-	if got := encryptedScalar(t, path, []string{"envs", "dev", "apps", "api", "values", "API_TOKEN"}); got != before {
-		t.Fatal("unknown key failure saved changes")
+	if got := strings.TrimSpace(stdout); got != "no" {
+		t.Fatalf("unexpected new value: %q", got)
+	}
+}
+
+func TestEditCreatesMissingEnv(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	addRecipientSet(t, path, "prod", "vaishnav")
+
+	t.Setenv("VISUAL", fakeEditor(t, `cat > "$1" <<'EOF'
+defaults:
+  recipientSet: prod
+options:
+  postgres:
+    host: staging-db
+apps:
+  api:
+    values:
+      API_TOKEN: staging-token
+EOF
+`))
+	t.Setenv("EDITOR", "")
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "edit", "-e", "staging"})
+	if code != 0 {
+		t.Fatalf("edit failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	stdout, stderr, code = runCLI([]string{"-f", path, "--user", "vaishnav", "get", "-e", "staging", "options.postgres.host", "--show"})
+	if code != 0 || stdout != "staging-db\n" {
+		t.Fatalf("unexpected created option: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	stdout, stderr, code = runCLI([]string{"-f", path, "--user", "vaishnav", "get", "-e", "staging", "-a", "api", "API_TOKEN", "--show"})
+	if code != 0 || stdout != "staging-token\n" {
+		t.Fatalf("unexpected created app value: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	raw := encryptedScalar(t, path, []string{"envs", "staging", "apps", "api", "values", "API_TOKEN"})
+	enc, err := envelope.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse created value: %v", err)
+	}
+	if enc.RecipientSet != "prod" {
+		t.Fatalf("expected edited env default recipient set, got %q", enc.RecipientSet)
+	}
+}
+
+func TestEditCreatesMissingEnvApp(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+
+	t.Setenv("VISUAL", fakeEditor(t, `cat > "$1" <<'EOF'
+values:
+  API_TOKEN: app-token
+EOF
+`))
+	t.Setenv("EDITOR", "")
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "edit", "-e", "staging", "-a", "api"})
+	if code != 0 {
+		t.Fatalf("edit failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	stdout, stderr, code = runCLI([]string{"-f", path, "--user", "vaishnav", "get", "-e", "staging", "-a", "api", "API_TOKEN", "--show"})
+	if code != 0 || stdout != "app-token\n" {
+		t.Fatalf("unexpected created app value: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestEditWithoutFlagsCanAddEnvAndShowsTopLevelMetadata(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "dev-token"})
+
+	t.Setenv("VISUAL", fakeEditor(t, `grep -q '^cin:' "$1" || exit 1
+grep -q 'defaults:' "$1" || exit 1
+tmp="$1.tmp"
+awk '{
+  print
+  if ($0 == "envs:") {
+    print "  staging:"
+    print "    apps:"
+    print "      api:"
+    print "        values:"
+    print "          API_TOKEN: staging-token"
+  }
+}' "$1" > "$tmp" && mv "$tmp" "$1"
+`))
+	t.Setenv("EDITOR", "")
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "edit"})
+	if code != 0 {
+		t.Fatalf("edit failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	stdout, stderr, code = runCLI([]string{"-f", path, "--user", "vaishnav", "get", "-e", "staging", "-a", "api", "API_TOKEN", "--show"})
+	if code != 0 || stdout != "staging-token\n" {
+		t.Fatalf("unexpected added env value: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestEditEnvDoesNotShowInheritedValues(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "base", "options.postgres.host", "base-db"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "extends", "base"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "dev-token"})
+
+	t.Setenv("VISUAL", fakeEditor(t, `grep -q 'extends: base' "$1" || exit 1
+grep -q 'base-db' "$1" && exit 1
+exit 0
+`))
+	t.Setenv("EDITOR", "")
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "edit", "-e", "dev"})
+	if code != 0 {
+		t.Fatalf("edit failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestEditAppDoesNotShowOrMutateReferencedOptions(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "options.postgres.host", "db-old"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "DATABASE_URL", "postgres://{{ .options.postgres.host }}/api"})
+
+	t.Setenv("VISUAL", fakeEditor(t, `grep -q 'db-old' "$1" && exit 1
+cat > "$1" <<'EOF'
+values:
+  DATABASE_URL: postgres://{{ .options.postgres.host }}/api2
+EOF
+`))
+	t.Setenv("EDITOR", "")
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "edit", "-e", "dev", "-a", "api"})
+	if code != 0 {
+		t.Fatalf("edit failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	stdout, stderr, code = runCLI([]string{"-f", path, "--user", "vaishnav", "get", "-e", "dev", "options.postgres.host", "--show"})
+	if code != 0 || stdout != "db-old\n" {
+		t.Fatalf("referenced option changed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	stdout, stderr, code = runCLI([]string{"-f", path, "--user", "vaishnav", "export", "-e", "dev", "-a", "api", "--stdout", "--yes"})
+	if code != 0 || !strings.Contains(stdout, "DATABASE_URL=postgres://db-old/api2") {
+		t.Fatalf("unexpected export: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 }
 

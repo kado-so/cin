@@ -422,7 +422,7 @@ Age private key discovery:
 
 ## Recipient set selection
 
-When writing a value with `cin set`:
+When writing a secret value with `cin set` or `cin edit`:
 
 ```text
 if overwriting an existing encrypted value:
@@ -661,13 +661,16 @@ Creates:
 
 ### Set
 
-`cin set` is the only config value write command.
+`cin set` writes the YAML path named by the user. `-e` is required for writes.
+`options.*` and `apps.*.values.*` are encrypted secret paths; other env paths
+such as `extends` and `defaults.recipientSet` are plaintext metadata.
 
 Set an option:
 
 ```bash
 cin set -e dev options.postgres.host postgres
 cin set -e dev options.postgres.password --prompt
+cin set -e dev extends base
 ```
 
 Writes:
@@ -675,18 +678,21 @@ Writes:
 ```text
 envs.dev.options.postgres.host
 envs.dev.options.postgres.password
+envs.dev.extends
 ```
 
 Set an app value:
 
 ```bash
 cin set -e dev -a api DATABASE_URL 'postgres://{{ .options.postgres.user }}@{{ .options.postgres.host }}/api'
+cin set -e dev apps.api.values.REDIS_URL redis://localhost:6379
 ```
 
 Writes:
 
 ```text
 envs.dev.apps.api.values.DATABASE_URL
+envs.dev.apps.api.values.REDIS_URL
 ```
 
 Rules:
@@ -1262,11 +1268,12 @@ model but more platform-sensitive.
 
 Edit behavior to cover:
 
-- `cin edit` uses the default env and edits all decryptable env data.
-- `cin edit -e dev` edits env-wide options and all app values.
-- `cin edit -e dev -a api` edits the focused app plus referenced options.
+- `cin edit` edits the whole config document, including plaintext metadata such
+  as `cin`, defaults, users, recipient sets, and env metadata.
+- `cin edit -e dev` edits raw `envs.dev`, creating it on save if missing.
+- `cin edit -e dev -a api` edits raw `envs.dev.apps.api`, creating it on save if missing.
 - Undecryptable values are omitted and listed without plaintext.
-- Unknown sections, unknown apps, and unknown keys fail without saving.
+- New environments, apps, options, and app values are accepted.
 - Schema/template failures fail without saving.
 - Unchanged encrypted values stay byte-identical.
 - Temp dirs are `0700`, temp files are `0600`, and cleanup happens on success,

@@ -354,7 +354,9 @@ func newSetCommand(filePath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			env = effectiveEnv(doc, env)
+			if env == "" {
+				return errors.New("environment is required")
+			}
 			key := args[0]
 			value := ""
 			if prompt {
@@ -372,36 +374,21 @@ func newSetCommand(filePath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			set, err := doc.RecipientSetForWrite(path, env, recipientSet)
-			if err != nil {
-				return err
-			}
-			recipients, err := doc.Recipients(set)
-			if err != nil {
-				return err
-			}
-
-			kind := envelope.Scalar
-			if strings.Contains(value, "{{") && strings.Contains(value, "}}") {
-				kind = envelope.Template
-			}
-			payload, err := encodePayload(kind, value)
-			if err != nil {
-				return err
-			}
-			ciphertext, err := cryptoage.Encrypt(payload, recipients.Recipients)
-			if err != nil {
-				return err
-			}
-			enc := envelope.Format(envelope.EncryptedValue{
-				Kind:         kind,
-				Algorithm:    envelope.AlgorithmAgeV1,
-				RecipientSet: set,
-				Users:        recipients.Users,
-				Ciphertext:   ciphertext,
-			})
-			if err := doc.SetScalar(path, enc); err != nil {
-				return err
+			if secretPath(path) {
+				enc, err := encryptedValue(doc, env, path, recipientSet, value)
+				if err != nil {
+					return err
+				}
+				if err := doc.SetScalar(path, enc); err != nil {
+					return err
+				}
+			} else {
+				if recipientSet != "" {
+					return errors.New("--recipient-set only applies to secret values")
+				}
+				if err := doc.SetScalar(path, value); err != nil {
+					return err
+				}
 			}
 			return doc.Save(*filePath)
 		},
@@ -433,6 +420,14 @@ func newGetCommand(stdout io.Writer, filePath *string, localFile *string, noLoca
 			path, err := targetPath(env, app, key)
 			if err != nil {
 				return err
+			}
+			if !secretPath(path) {
+				value, ok := doc.GetScalar(path)
+				if !ok {
+					return missingValueError(doc, env, app, key)
+				}
+				fmt.Fprintln(stdout, value)
+				return nil
 			}
 			resolved, err := resolvedEnv(doc, *localFile, *noLocal, env)
 			if err != nil {
@@ -577,7 +572,6 @@ func newEditCommand(filePath *string, user *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			env = effectiveEnv(doc, env)
 			current, err := currentUser(*user)
 			if err != nil {
 				return err
@@ -586,22 +580,10 @@ func newEditCommand(filePath *string, user *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			var session *editSession
-			if app == "" {
-				session, err = buildEnvEditSession(doc, env, identities)
-			} else {
-				session, err = buildEditSession(doc, env, app, identities)
+			if app != "" && env == "" {
+				return errors.New("environment is required when using -a")
 			}
-			if err != nil {
-				return err
-			}
-			if !sessionHasEditableValues(session) {
-				if app == "" {
-					return fmt.Errorf("no editable values found for env %s", env)
-				}
-				return fmt.Errorf("no editable values found for env %s app %s", env, app)
-			}
-			data, err := renderEditSession(session)
+			data, err := renderEditDocument(doc, env, app, identities)
 			if err != nil {
 				return err
 			}
@@ -625,18 +607,14 @@ func newEditCommand(filePath *string, user *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			edited, err := parseEditDocument(editedData)
-			if err != nil {
-				return err
-			}
-			changed, err := applyEditSession(doc, env, session, edited)
+			changed, changedEnvs, err := applyEditDocument(doc, env, app, identities, editedData)
 			if err != nil {
 				return err
 			}
 			if !changed {
 				return nil
 			}
-			if err := validateEditedDoc(doc, *filePath, env, app, identities, session); err != nil {
+			if err := validateEditedScope(doc, *filePath, changedEnvs, app, identities); err != nil {
 				return err
 			}
 			return doc.Save(*filePath)
@@ -665,6 +643,17 @@ func newExplainCommand(stdout io.Writer, filePath *string, localFile *string, no
 			path, err := targetPath(env, app, key)
 			if err != nil {
 				return err
+			}
+			if !secretPath(path) {
+				value, ok := doc.GetScalar(path)
+				if !ok {
+					return missingValueError(doc, env, app, key)
+				}
+				fmt.Fprintln(stdout, key)
+				fmt.Fprintf(stdout, "  source: %s\n", strings.Join(path, "."))
+				fmt.Fprintln(stdout, "  kind: plaintext")
+				fmt.Fprintf(stdout, "  value: %s\n", value)
+				return nil
 			}
 			result, err := resolveResult(doc, *localFile, *noLocal, *user, env, app)
 			if err != nil {
@@ -949,176 +938,530 @@ func defaultPager() string {
 	return "less"
 }
 
-type editSession struct {
-	Values  map[string]editEntry
-	Options map[string]editEntry
-	Apps    map[string]map[string]editEntry
-	Omitted []string
-	Broad   bool
-}
-
-type editEntry struct {
-	Path   []string
-	Value  string
-	Exists bool
-}
-
-type editDocument struct {
-	Values  map[string]string
-	Options map[string]string
-	Apps    map[string]map[string]string
-}
-
-func buildEditSession(doc *config.Document, env, app string, identities []age.Identity) (*editSession, error) {
-	resolved, err := doc.ResolvedEnv(env)
-	if err != nil {
-		return nil, err
-	}
-	result, err := resolve.Env(resolved, app, identities)
-	if err != nil {
-		return nil, err
-	}
-
-	session := &editSession{
-		Values:  map[string]editEntry{},
-		Options: map[string]editEntry{},
-		Apps:    map[string]map[string]editEntry{},
-	}
-	var refs []string
-	for _, key := range result.AppKeys() {
-		canonical := resolve.CanonicalPath(app, key)
-		value, ok := result.Value(canonical)
-		if !ok {
-			continue
+func renderEditDocument(doc *config.Document, env, app string, identities []age.Identity) ([]byte, error) {
+	var root *yaml.Node
+	var omitted []string
+	if env == "" {
+		root = doc.CloneNode(nil)
+		if root == nil {
+			root = emptyYAMLMap()
 		}
-		plaintext, kind, decryptable, err := editablePlaintext(value.Raw, canonical, identities)
+		var err error
+		omitted, err = decryptRootSecrets(root, identities)
 		if err != nil {
 			return nil, err
 		}
-		if !decryptable {
-			session.Omitted = append(session.Omitted, strings.Join([]string{"envs", env, "apps", app, "values", key}, "."))
-			continue
-		}
-		session.Values[key] = editEntry{
-			Path:   []string{"envs", env, "apps", app, "values", key},
-			Value:  plaintext,
-			Exists: true,
-		}
-		if kind == envelope.Template {
-			more, err := resolve.TemplateReferences(plaintext, app)
-			if err != nil {
-				return nil, fmt.Errorf("%s uses unsupported template syntax: %w", canonical, err)
-			}
-			refs = append(refs, more...)
-		}
-	}
-
-	seen := map[string]bool{}
-	for len(refs) > 0 {
-		ref := refs[0]
-		refs = refs[1:]
-		if seen[ref] || !strings.HasPrefix(ref, "options.") {
-			continue
-		}
-		seen[ref] = true
-		optionPath, ok := config.OptionPath(ref)
-		if !ok {
-			continue
-		}
-		value, ok := result.Value(ref)
-		if !ok {
-			session.Options[ref] = editEntry{
-				Path:   append([]string{"envs", env, "options"}, optionPath...),
-				Value:  "",
-				Exists: false,
-			}
-			continue
-		}
-		plaintext, kind, decryptable, err := editablePlaintext(value.Raw, ref, identities)
+	} else if app == "" {
+		var more []string
+		var err error
+		root, more, err = editableEnvNode(doc, env, identities)
 		if err != nil {
 			return nil, err
 		}
-		if !decryptable {
-			session.Omitted = append(session.Omitted, strings.Join(append([]string{"envs", env, "options"}, optionPath...), "."))
-			continue
+		omitted = append(omitted, more...)
+	} else {
+		var more []string
+		var err error
+		root, more, err = editableAppNode(doc, env, app, identities)
+		if err != nil {
+			return nil, err
 		}
-		session.Options[ref] = editEntry{
-			Path:   append([]string{"envs", env, "options"}, optionPath...),
-			Value:  plaintext,
-			Exists: true,
-		}
-		if kind == envelope.Template {
-			more, err := resolve.TemplateReferences(plaintext, app)
-			if err != nil {
-				return nil, fmt.Errorf("%s uses unsupported template syntax: %w", ref, err)
-			}
-			refs = append(refs, more...)
-		}
+		omitted = append(omitted, more...)
 	}
-	return session, nil
+	if len(omitted) > 0 {
+		sort.Strings(omitted)
+		root.HeadComment = "omitted undecryptable values:\n- " + strings.Join(omitted, "\n- ")
+	}
+
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(root); err != nil {
+		enc.Close()
+		return nil, err
+	}
+	if err := enc.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
-func buildEnvEditSession(doc *config.Document, env string, identities []age.Identity) (*editSession, error) {
-	resolved, err := doc.ResolvedEnv(env)
-	if err != nil {
-		return nil, err
+func decryptRootSecrets(root *yaml.Node, identities []age.Identity) ([]string, error) {
+	if root.Kind != yaml.MappingNode {
+		return nil, errors.New("config root must be a map")
 	}
-	result, err := resolve.Env(resolved, "", identities)
-	if err != nil {
-		return nil, err
+	envs := yamlMapValue(root, "envs")
+	if envs == nil {
+		return nil, nil
 	}
+	if envs.Kind != yaml.MappingNode {
+		return nil, errors.New("envs must be a map")
+	}
+	var omitted []string
+	for i := 0; i < len(envs.Content); i += 2 {
+		env := envs.Content[i].Value
+		envNode := envs.Content[i+1]
+		if envNode.Kind != yaml.MappingNode {
+			return nil, fmt.Errorf("environment must be a map: %s", env)
+		}
+		more, err := decryptEnvSecrets(envNode, env, identities)
+		if err != nil {
+			return nil, err
+		}
+		omitted = append(omitted, more...)
+	}
+	return omitted, nil
+}
 
-	session := &editSession{
-		Values:  map[string]editEntry{},
-		Options: map[string]editEntry{},
-		Apps:    map[string]map[string]editEntry{},
-		Broad:   true,
+func editableEnvNode(doc *config.Document, env string, identities []age.Identity) (*yaml.Node, []string, error) {
+	node := doc.CloneNode([]string{"envs", env})
+	if node == nil {
+		node = skeletonEnvNode()
 	}
-	for _, key := range sortedValuePaths(result.Values) {
-		value, _ := result.Value(key)
-		switch {
-		case strings.HasPrefix(key, "options."):
-			optionPath, ok := config.OptionPath(key)
-			if !ok {
-				continue
+	if node.Kind != yaml.MappingNode {
+		return nil, nil, fmt.Errorf("environment must be a map: %s", env)
+	}
+	omitted, err := decryptEnvSecrets(node, env, identities)
+	return node, omitted, err
+}
+
+func editableAppNode(doc *config.Document, env, app string, identities []age.Identity) (*yaml.Node, []string, error) {
+	node := doc.CloneNode([]string{"envs", env, "apps", app})
+	if node == nil {
+		node = skeletonAppNode()
+	}
+	if node.Kind != yaml.MappingNode {
+		return nil, nil, fmt.Errorf("app must be a map: %s", app)
+	}
+	omitted, err := decryptAppSecrets(node, env, app, identities)
+	return node, omitted, err
+}
+
+func decryptEnvSecrets(envNode *yaml.Node, env string, identities []age.Identity) ([]string, error) {
+	var omitted []string
+	if options := yamlMapValue(envNode, "options"); options != nil {
+		more, err := decryptOptions(options, []string{"envs", env, "options"}, identities)
+		if err != nil {
+			return nil, err
+		}
+		omitted = append(omitted, more...)
+	}
+	if apps := yamlMapValue(envNode, "apps"); apps != nil {
+		if apps.Kind != yaml.MappingNode {
+			return nil, errors.New("apps must be a map")
+		}
+		for i := 0; i < len(apps.Content); i += 2 {
+			app := apps.Content[i].Value
+			appNode := apps.Content[i+1]
+			if appNode.Kind != yaml.MappingNode {
+				return nil, fmt.Errorf("apps.%s must be a map", app)
 			}
-			plaintext, _, decryptable, err := editablePlaintext(value.Raw, key, identities)
+			more, err := decryptAppSecrets(appNode, env, app, identities)
 			if err != nil {
 				return nil, err
 			}
-			if !decryptable {
-				session.Omitted = append(session.Omitted, strings.Join(append([]string{"envs", env, "options"}, optionPath...), "."))
-				continue
-			}
-			session.Options[key] = editEntry{
-				Path:   append([]string{"envs", env, "options"}, optionPath...),
-				Value:  plaintext,
-				Exists: true,
-			}
-		case strings.HasPrefix(key, "apps."):
-			app, valueKey, ok := appValuePath(key)
-			if !ok {
-				continue
-			}
-			plaintext, _, decryptable, err := editablePlaintext(value.Raw, key, identities)
+			omitted = append(omitted, more...)
+		}
+	}
+	return omitted, nil
+}
+
+func decryptAppSecrets(appNode *yaml.Node, env, app string, identities []age.Identity) ([]string, error) {
+	values := yamlMapValue(appNode, "values")
+	if values == nil {
+		return nil, nil
+	}
+	if values.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("apps.%s.values must be a map", app)
+	}
+	return decryptSecretValues(values, []string{"envs", env, "apps", app, "values"}, identities)
+}
+
+func decryptOptions(node *yaml.Node, path []string, identities []age.Identity) ([]string, error) {
+	if node.Kind != yaml.MappingNode {
+		return nil, errors.New("options must be a map")
+	}
+	var omitted []string
+	for i := 0; i < len(node.Content); {
+		key := node.Content[i].Value
+		value := node.Content[i+1]
+		nextPath := append(path, key)
+		if value.Kind == yaml.MappingNode {
+			more, err := decryptOptions(value, nextPath, identities)
 			if err != nil {
 				return nil, err
 			}
-			if !decryptable {
-				session.Omitted = append(session.Omitted, strings.Join([]string{"envs", env, "apps", app, "values", valueKey}, "."))
-				continue
-			}
-			if session.Apps[app] == nil {
-				session.Apps[app] = map[string]editEntry{}
-			}
-			session.Apps[app][valueKey] = editEntry{
-				Path:   []string{"envs", env, "apps", app, "values", valueKey},
-				Value:  plaintext,
-				Exists: true,
+			omitted = append(omitted, more...)
+			i += 2
+			continue
+		}
+		ok, err := decryptSecretNode(value, strings.Join(nextPath, "."), identities)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			omitted = append(omitted, strings.Join(nextPath, "."))
+			node.Content = append(node.Content[:i], node.Content[i+2:]...)
+			continue
+		}
+		i += 2
+	}
+	return omitted, nil
+}
+
+func decryptSecretValues(node *yaml.Node, path []string, identities []age.Identity) ([]string, error) {
+	var omitted []string
+	for i := 0; i < len(node.Content); {
+		key := node.Content[i].Value
+		value := node.Content[i+1]
+		nextPath := append(path, key)
+		ok, err := decryptSecretNode(value, strings.Join(nextPath, "."), identities)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			omitted = append(omitted, strings.Join(nextPath, "."))
+			node.Content = append(node.Content[:i], node.Content[i+2:]...)
+			continue
+		}
+		i += 2
+	}
+	return omitted, nil
+}
+
+func decryptSecretNode(node *yaml.Node, path string, identities []age.Identity) (bool, error) {
+	if node.Kind != yaml.ScalarNode {
+		return false, fmt.Errorf("%s must be an encrypted scalar", path)
+	}
+	plaintext, _, decryptable, err := editablePlaintext(node.Value, path, identities)
+	if err != nil || !decryptable {
+		return decryptable, err
+	}
+	*node = *yamlScalar(plaintext)
+	return true, nil
+}
+
+func applyEditDocument(doc *config.Document, env, app string, identities []age.Identity, data []byte) (bool, []string, error) {
+	root, err := parseEditedYAML(data)
+	if err != nil {
+		return false, nil, err
+	}
+	if env == "" {
+		return applyRootNode(doc, root, identities)
+	}
+	if app != "" {
+		changed, err := applyAppNode(doc, env, app, root, identities)
+		if changed {
+			return true, []string{env}, err
+		}
+		return false, nil, err
+	}
+	changed, err := applyEnvNode(doc, env, root, identities)
+	if changed {
+		return true, []string{env}, err
+	}
+	return false, nil, err
+}
+
+func applyRootNode(doc *config.Document, node *yaml.Node, identities []age.Identity) (bool, []string, error) {
+	if node.Kind != yaml.MappingNode {
+		return false, nil, errors.New("config root must be a map")
+	}
+	edited := cloneYAMLNode(node)
+	if err := encryptRootSecrets(doc, edited, identities); err != nil {
+		return false, nil, err
+	}
+	if err := preserveUndecryptableRootSecrets(doc, edited, identities); err != nil {
+		return false, nil, err
+	}
+	before := doc.CloneNode(nil)
+	if yamlNodeString(before) == yamlNodeString(edited) {
+		return false, nil, nil
+	}
+	doc.ReplaceRoot(edited)
+	return true, editedEnvNames(edited), nil
+}
+
+func parseEditedYAML(data []byte) (*yaml.Node, error) {
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return nil, fmt.Errorf("edited document is not valid YAML")
+	}
+	if len(root.Content) == 0 || root.Content[0].Kind != yaml.MappingNode {
+		return nil, errors.New("edited document must be a map")
+	}
+	return root.Content[0], nil
+}
+
+func applyEnvNode(doc *config.Document, env string, node *yaml.Node, identities []age.Identity) (bool, error) {
+	if node.Kind != yaml.MappingNode {
+		return false, fmt.Errorf("environment must be a map: %s", env)
+	}
+	edited := cloneYAMLNode(node)
+	if err := encryptEnvSecrets(doc, env, edited, identities); err != nil {
+		return false, err
+	}
+	if err := preserveUndecryptableSecrets(doc, env, edited, identities); err != nil {
+		return false, err
+	}
+	before := doc.CloneNode([]string{"envs", env})
+	if before == nil && emptyMapping(edited) {
+		return false, nil
+	}
+	if yamlNodeString(before) == yamlNodeString(edited) {
+		return false, nil
+	}
+	return true, doc.SetNode([]string{"envs", env}, edited)
+}
+
+func applyAppNode(doc *config.Document, env, app string, node *yaml.Node, identities []age.Identity) (bool, error) {
+	if node.Kind != yaml.MappingNode {
+		return false, fmt.Errorf("app must be a map: %s", app)
+	}
+	edited := cloneYAMLNode(node)
+	if err := encryptAppSecrets(doc, env, app, edited, identities, doc.EnvDefaultRecipientSet(env)); err != nil {
+		return false, err
+	}
+	if err := preserveUndecryptableAppSecrets(doc, env, app, edited, identities); err != nil {
+		return false, err
+	}
+	before := doc.CloneNode([]string{"envs", env, "apps", app})
+	if before == nil && emptyMapping(edited) {
+		return false, nil
+	}
+	if yamlNodeString(before) == yamlNodeString(edited) {
+		return false, nil
+	}
+	return true, doc.SetNode([]string{"envs", env, "apps", app}, edited)
+}
+
+func encryptRootSecrets(doc *config.Document, root *yaml.Node, identities []age.Identity) error {
+	envs := yamlMapValue(root, "envs")
+	if envs == nil {
+		return nil
+	}
+	if envs.Kind != yaml.MappingNode {
+		return errors.New("envs must be a map")
+	}
+	for i := 0; i < len(envs.Content); i += 2 {
+		env := envs.Content[i].Value
+		envNode := envs.Content[i+1]
+		if envNode.Kind != yaml.MappingNode {
+			return fmt.Errorf("environment must be a map: %s", env)
+		}
+		if err := encryptEnvSecrets(doc, env, envNode, identities); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func encryptEnvSecrets(doc *config.Document, env string, envNode *yaml.Node, identities []age.Identity) error {
+	envDefaultSet := envDefaultRecipientSet(envNode)
+	if options := yamlMapValue(envNode, "options"); options != nil {
+		if err := encryptOptions(doc, env, []string{"envs", env, "options"}, options, identities, envDefaultSet); err != nil {
+			return err
+		}
+	}
+	if apps := yamlMapValue(envNode, "apps"); apps != nil {
+		if apps.Kind != yaml.MappingNode {
+			return errors.New("apps must be a map")
+		}
+		for i := 0; i < len(apps.Content); i += 2 {
+			app := apps.Content[i].Value
+			appNode := apps.Content[i+1]
+			if err := encryptAppSecrets(doc, env, app, appNode, identities, envDefaultSet); err != nil {
+				return err
 			}
 		}
 	}
-	return session, nil
+	return nil
+}
+
+func encryptAppSecrets(doc *config.Document, env, app string, appNode *yaml.Node, identities []age.Identity, envDefaultSet string) error {
+	if appNode.Kind != yaml.MappingNode {
+		return fmt.Errorf("apps.%s must be a map", app)
+	}
+	values := yamlMapValue(appNode, "values")
+	if values == nil {
+		return nil
+	}
+	if values.Kind != yaml.MappingNode {
+		return fmt.Errorf("apps.%s.values must be a map", app)
+	}
+	for i := 0; i < len(values.Content); i += 2 {
+		path := []string{"envs", env, "apps", app, "values", values.Content[i].Value}
+		if err := encryptSecretNode(doc, env, path, values.Content[i+1], identities, envDefaultSet); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func encryptOptions(doc *config.Document, env string, path []string, node *yaml.Node, identities []age.Identity, envDefaultSet string) error {
+	if node.Kind != yaml.MappingNode {
+		return errors.New("options must be a map")
+	}
+	for i := 0; i < len(node.Content); i += 2 {
+		nextPath := append(path, node.Content[i].Value)
+		value := node.Content[i+1]
+		if value.Kind == yaml.MappingNode {
+			if err := encryptOptions(doc, env, nextPath, value, identities, envDefaultSet); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := encryptSecretNode(doc, env, nextPath, value, identities, envDefaultSet); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func encryptSecretNode(doc *config.Document, env string, path []string, node *yaml.Node, identities []age.Identity, envDefaultSet string) error {
+	value, err := editNodeText(node)
+	if err != nil {
+		return err
+	}
+	if existing, ok := doc.GetScalar(path); ok {
+		plaintext, _, decryptable, err := editablePlaintext(existing, strings.Join(path, "."), identities)
+		if err == nil && decryptable && plaintext == value {
+			*node = *yamlScalar(existing)
+			return nil
+		}
+	}
+	enc, err := encryptedEditedValue(doc, env, path, value, envDefaultSet)
+	if err != nil {
+		return err
+	}
+	*node = *yamlScalar(enc)
+	return nil
+}
+
+func preserveUndecryptableRootSecrets(doc *config.Document, root *yaml.Node, identities []age.Identity) error {
+	for _, ref := range doc.ValueRefs() {
+		envNode := yamlLookup(root, []string{"envs", ref.Env})
+		if envNode == nil {
+			continue
+		}
+		if yamlLookup(root, ref.Path) != nil {
+			continue
+		}
+		_, _, decryptable, err := editablePlaintext(ref.Raw, strings.Join(ref.Path, "."), identities)
+		if err != nil {
+			return err
+		}
+		if !decryptable {
+			setYAMLPath(root, ref.Path, yamlScalar(ref.Raw))
+		}
+	}
+	return nil
+}
+
+func preserveUndecryptableSecrets(doc *config.Document, env string, envNode *yaml.Node, identities []age.Identity) error {
+	for _, ref := range doc.ValueRefs() {
+		if ref.Env != env {
+			continue
+		}
+		if yamlLookup(envNode, ref.Path[2:]) != nil {
+			continue
+		}
+		_, _, decryptable, err := editablePlaintext(ref.Raw, strings.Join(ref.Path, "."), identities)
+		if err != nil {
+			return err
+		}
+		if !decryptable {
+			setYAMLPath(envNode, ref.Path[2:], yamlScalar(ref.Raw))
+		}
+	}
+	return nil
+}
+
+func preserveUndecryptableAppSecrets(doc *config.Document, env, app string, appNode *yaml.Node, identities []age.Identity) error {
+	for _, ref := range doc.ValueRefs() {
+		if ref.Env != env || ref.App != app {
+			continue
+		}
+		rel := ref.Path[4:]
+		if yamlLookup(appNode, rel) != nil {
+			continue
+		}
+		_, _, decryptable, err := editablePlaintext(ref.Raw, strings.Join(ref.Path, "."), identities)
+		if err != nil {
+			return err
+		}
+		if !decryptable {
+			setYAMLPath(appNode, rel, yamlScalar(ref.Raw))
+		}
+	}
+	return nil
+}
+
+func emptyYAMLMap() *yaml.Node {
+	return &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+}
+
+func skeletonEnvNode() *yaml.Node {
+	return &yaml.Node{
+		Kind: yaml.MappingNode,
+		Tag:  "!!map",
+		Content: []*yaml.Node{
+			yamlScalar("options"), emptyYAMLMap(),
+			yamlScalar("apps"), emptyYAMLMap(),
+		},
+	}
+}
+
+func skeletonAppNode() *yaml.Node {
+	return mapNode("values", emptyYAMLMap())
+}
+
+func cloneYAMLNode(node *yaml.Node) *yaml.Node {
+	if node == nil {
+		return nil
+	}
+	clone := *node
+	clone.Content = make([]*yaml.Node, len(node.Content))
+	for i, child := range node.Content {
+		clone.Content[i] = cloneYAMLNode(child)
+	}
+	return &clone
+}
+
+func yamlLookup(node *yaml.Node, path []string) *yaml.Node {
+	cur := node
+	for _, key := range path {
+		if cur == nil || cur.Kind != yaml.MappingNode {
+			return nil
+		}
+		cur = yamlMapValue(cur, key)
+	}
+	return cur
+}
+
+func yamlNodeString(node *yaml.Node) string {
+	if node == nil {
+		return ""
+	}
+	data, _ := yaml.Marshal(node)
+	return string(data)
+}
+
+func emptyMapping(node *yaml.Node) bool {
+	return node != nil && node.Kind == yaml.MappingNode && len(node.Content) == 0
+}
+
+func editedEnvNames(root *yaml.Node) []string {
+	envs := yamlMapValue(root, "envs")
+	if envs == nil || envs.Kind != yaml.MappingNode {
+		return nil
+	}
+	names := make([]string, 0, len(envs.Content)/2)
+	for i := 0; i < len(envs.Content); i += 2 {
+		names = append(names, envs.Content[i].Value)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func editablePlaintext(raw, path string, identities []age.Identity) (string, envelope.Kind, bool, error) {
@@ -1135,185 +1478,6 @@ func editablePlaintext(raw, path string, identities []age.Identity) (string, env
 		return "", "", false, fmt.Errorf("cannot decode %s", path)
 	}
 	return value, enc.Kind, true, nil
-}
-
-func renderEditSession(session *editSession) ([]byte, error) {
-	root := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
-	if len(session.Omitted) > 0 {
-		sort.Strings(session.Omitted)
-		root.HeadComment = "omitted undecryptable values:\n- " + strings.Join(session.Omitted, "\n- ")
-	}
-
-	if session.Broad {
-		if len(session.Options) > 0 {
-			root.Content = append(root.Content, yamlScalar("options"), renderEditOptions(session.Options))
-		}
-		if len(session.Apps) > 0 {
-			apps := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
-			for _, app := range sortedAppKeys(session.Apps) {
-				values := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
-				for _, key := range sortedEditKeys(session.Apps[app]) {
-					values.Content = append(values.Content, yamlScalar(key), yamlScalar(session.Apps[app][key].Value))
-				}
-				apps.Content = append(apps.Content, yamlScalar(app), mapNode("values", values))
-			}
-			root.Content = append(root.Content, yamlScalar("apps"), apps)
-		}
-	} else {
-		values := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
-		for _, key := range sortedEditKeys(session.Values) {
-			values.Content = append(values.Content, yamlScalar(key), yamlScalar(session.Values[key].Value))
-		}
-		root.Content = append(root.Content, yamlScalar("values"), values)
-		if len(session.Options) > 0 {
-			root.Content = append(root.Content, yamlScalar("options"), renderEditOptions(session.Options))
-		}
-	}
-
-	var buf bytes.Buffer
-	enc := yaml.NewEncoder(&buf)
-	enc.SetIndent(2)
-	if err := enc.Encode(root); err != nil {
-		enc.Close()
-		return nil, err
-	}
-	if err := enc.Close(); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-func renderEditOptions(entries map[string]editEntry) *yaml.Node {
-	options := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
-	for _, key := range sortedEditKeys(entries) {
-		path, _ := config.OptionPath(key)
-		setYAMLPath(options, path, yamlScalar(entries[key].Value))
-	}
-	return options
-}
-
-func parseEditDocument(data []byte) (editDocument, error) {
-	var root yaml.Node
-	if err := yaml.Unmarshal(data, &root); err != nil {
-		return editDocument{}, fmt.Errorf("edited document is not valid YAML")
-	}
-	if len(root.Content) == 0 || root.Content[0].Kind != yaml.MappingNode {
-		return editDocument{}, errors.New("edited document must be a map")
-	}
-	out := editDocument{
-		Values:  map[string]string{},
-		Options: map[string]string{},
-		Apps:    map[string]map[string]string{},
-	}
-	for i := 0; i < len(root.Content[0].Content); i += 2 {
-		key := root.Content[0].Content[i].Value
-		node := root.Content[0].Content[i+1]
-		switch key {
-		case "values":
-			values, err := editValues(node)
-			if err != nil {
-				return editDocument{}, fmt.Errorf("values must be a map")
-			}
-			for k, v := range values {
-				out.Values[k] = v
-			}
-		case "options":
-			options, err := editOptions(node, nil)
-			if err != nil {
-				return editDocument{}, fmt.Errorf("options must be a map")
-			}
-			for k, v := range options {
-				out.Options["options."+k] = v
-			}
-		case "apps":
-			apps, err := editApps(node)
-			if err != nil {
-				return editDocument{}, err
-			}
-			for app, values := range apps {
-				out.Apps[app] = values
-			}
-		default:
-			return editDocument{}, fmt.Errorf("unknown edit section: %s", key)
-		}
-	}
-	return out, nil
-}
-
-func editApps(node *yaml.Node) (map[string]map[string]string, error) {
-	if node == nil || node.Kind != yaml.MappingNode {
-		return nil, errors.New("apps must be a map")
-	}
-	out := map[string]map[string]string{}
-	for i := 0; i < len(node.Content); i += 2 {
-		app := node.Content[i].Value
-		appNode := node.Content[i+1]
-		if appNode == nil || appNode.Kind != yaml.MappingNode {
-			return nil, fmt.Errorf("apps.%s must be a map", app)
-		}
-		values := map[string]string{}
-		for j := 0; j < len(appNode.Content); j += 2 {
-			key := appNode.Content[j].Value
-			value := appNode.Content[j+1]
-			switch key {
-			case "values":
-				parsed, err := editValues(value)
-				if err != nil {
-					return nil, fmt.Errorf("apps.%s.values must be a map", app)
-				}
-				for k, v := range parsed {
-					values[k] = v
-				}
-			default:
-				return nil, fmt.Errorf("unknown edit section: apps.%s.%s", app, key)
-			}
-		}
-		out[app] = values
-	}
-	return out, nil
-}
-
-func editValues(node *yaml.Node) (map[string]string, error) {
-	if node == nil || node.Kind != yaml.MappingNode {
-		return nil, errors.New("not a map")
-	}
-	out := map[string]string{}
-	for i := 0; i < len(node.Content); i += 2 {
-		text, err := editNodeText(node.Content[i+1])
-		if err != nil {
-			return nil, err
-		}
-		out[node.Content[i].Value] = text
-	}
-	return out, nil
-}
-
-func editOptions(node *yaml.Node, prefix []string) (map[string]string, error) {
-	if node == nil || node.Kind != yaml.MappingNode {
-		return nil, errors.New("not a map")
-	}
-	out := map[string]string{}
-	for i := 0; i < len(node.Content); i += 2 {
-		key := node.Content[i].Value
-		value := node.Content[i+1]
-		path := append(prefix, key)
-		if value.Kind == yaml.MappingNode {
-			nested, err := editOptions(value, path)
-			if err != nil {
-				return nil, err
-			}
-			for k, v := range nested {
-				out[k] = v
-			}
-			continue
-		}
-		text, err := editNodeText(value)
-		if err != nil {
-			return nil, err
-		}
-		out[strings.Join(path, ".")] = text
-	}
-	return out, nil
 }
 
 func editNodeText(node *yaml.Node) (string, error) {
@@ -1349,98 +1513,31 @@ func editNodeValue(node *yaml.Node) any {
 	}
 }
 
-func applyEditSession(doc *config.Document, env string, session *editSession, edited editDocument) (bool, error) {
-	if err := rejectUnknownEdits("values", edited.Values, session.Values); err != nil {
-		return false, err
-	}
-	if err := rejectUnknownEdits("options", edited.Options, session.Options); err != nil {
-		return false, err
-	}
-	if err := rejectUnknownAppEdits(edited.Apps, session.Apps); err != nil {
-		return false, err
-	}
-	changed := false
-	for key, entry := range session.Values {
-		value, ok := edited.Values[key]
-		if !ok {
-			return false, fmt.Errorf("edited document is missing values.%s", key)
-		}
-		if (!entry.Exists && value == "") || value == entry.Value {
-			continue
-		}
-		if err := encryptEditedValue(doc, env, entry.Path, value); err != nil {
-			return false, err
-		}
-		changed = true
-	}
-	for key, entry := range session.Options {
-		value, ok := edited.Options[key]
-		if !ok {
-			return false, fmt.Errorf("edited document is missing %s", key)
-		}
-		if (!entry.Exists && value == "") || value == entry.Value {
-			continue
-		}
-		if err := encryptEditedValue(doc, env, entry.Path, value); err != nil {
-			return false, err
-		}
-		changed = true
-	}
-	for app, values := range session.Apps {
-		editedValues, ok := edited.Apps[app]
-		if !ok {
-			return false, fmt.Errorf("edited document is missing apps.%s", app)
-		}
-		for key, entry := range values {
-			value, ok := editedValues[key]
-			if !ok {
-				return false, fmt.Errorf("edited document is missing apps.%s.values.%s", app, key)
-			}
-			if (!entry.Exists && value == "") || value == entry.Value {
-				continue
-			}
-			if err := encryptEditedValue(doc, env, entry.Path, value); err != nil {
-				return false, err
-			}
-			changed = true
-		}
-	}
-	return changed, nil
-}
-
-func rejectUnknownAppEdits(edited map[string]map[string]string, allowed map[string]map[string]editEntry) error {
-	for app, values := range edited {
-		allowedValues, ok := allowed[app]
-		if !ok {
-			return fmt.Errorf("unknown editable app: %s", app)
-		}
-		if err := rejectUnknownEdits("apps."+app+".values", values, allowedValues); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func rejectUnknownEdits(section string, edited map[string]string, allowed map[string]editEntry) error {
-	for key := range edited {
-		if _, ok := allowed[key]; !ok {
-			if section == "options" {
-				return fmt.Errorf("unknown editable key: %s", key)
-			}
-			return fmt.Errorf("unknown editable key: %s.%s", section, key)
-		}
-	}
-	return nil
-}
-
-func encryptEditedValue(doc *config.Document, env string, path []string, value string) error {
-	set, err := doc.RecipientSetForWrite(path, env, "")
+func encryptedValue(doc *config.Document, env string, path []string, recipientSet string, value string) (string, error) {
+	set, err := doc.RecipientSetForWrite(path, env, recipientSet)
 	if err != nil {
-		return err
+		return "", err
 	}
+	return encryptedValueWithSet(doc, set, value)
+}
+
+func encryptedEditedValue(doc *config.Document, env string, path []string, value string, envDefaultSet string) (string, error) {
+	if enc, ok := doc.ExistingEncrypted(path); ok && enc.RecipientSet != "" {
+		return encryptedValueWithSet(doc, enc.RecipientSet, value)
+	}
+	if envDefaultSet != "" {
+		return encryptedValueWithSet(doc, envDefaultSet, value)
+	}
+	if set, ok := doc.GetScalar([]string{"cin", "defaults", "recipientSet"}); ok && set != "" {
+		return encryptedValueWithSet(doc, set, value)
+	}
+	return "", errors.New("recipient set is required")
+}
+
+func encryptedValueWithSet(doc *config.Document, set string, value string) (string, error) {
 	recipients, err := doc.Recipients(set)
 	if err != nil {
-		return err
+		return "", err
 	}
 	kind := envelope.Scalar
 	if strings.Contains(value, "{{") && strings.Contains(value, "}}") {
@@ -1448,26 +1545,34 @@ func encryptEditedValue(doc *config.Document, env string, path []string, value s
 	}
 	payload, err := encodePayload(kind, value)
 	if err != nil {
-		return err
+		return "", err
 	}
 	ciphertext, err := cryptoage.Encrypt(payload, recipients.Recipients)
 	if err != nil {
-		return err
+		return "", err
 	}
-	return doc.SetScalar(path, envelope.Format(envelope.EncryptedValue{
+	return envelope.Format(envelope.EncryptedValue{
 		Kind:         kind,
 		Algorithm:    envelope.AlgorithmAgeV1,
 		RecipientSet: set,
 		Users:        recipients.Users,
 		Ciphertext:   ciphertext,
-	}))
+	}), nil
 }
 
-func validateEditedDoc(doc *config.Document, filePath, env, app string, identities []age.Identity, session *editSession) error {
-	resolved, err := doc.ResolvedEnv(env)
-	if err != nil {
-		return err
+func envDefaultRecipientSet(envNode *yaml.Node) string {
+	defaults := yamlMapValue(envNode, "defaults")
+	if defaults == nil || defaults.Kind != yaml.MappingNode {
+		return ""
 	}
+	value := yamlMapValue(defaults, "recipientSet")
+	if value == nil || value.Kind != yaml.ScalarNode {
+		return ""
+	}
+	return value.Value
+}
+
+func validateEditedScope(doc *config.Document, filePath string, envs []string, app string, identities []age.Identity) error {
 	schemas, err := cinschema.Discover(doc, filePath)
 	if err != nil {
 		return err
@@ -1475,44 +1580,53 @@ func validateEditedDoc(doc *config.Document, filePath, env, app string, identiti
 	if len(schemas.LoadErrors) > 0 {
 		return fmt.Errorf("schema file is invalid: %s: %v", schemas.LoadErrors[0].Path, schemas.LoadErrors[0].Err)
 	}
-	apps := []string{app}
-	if app == "" {
-		apps = sortedAppKeys(session.Apps)
-	}
-	for _, appName := range apps {
-		if session.Broad && appHasOmittedValue(session, env, appName) {
-			if err := validateEditableAppTemplates(resolved, appName, identities, session.Apps[appName]); err != nil {
-				return err
-			}
+	for _, env := range envs {
+		if !doc.HasEnv(env) {
 			continue
 		}
-		result, err := resolve.Env(resolved, appName, identities)
+		resolved, err := doc.ResolvedEnv(env)
 		if err != nil {
 			return err
 		}
-		for _, key := range result.AppKeys() {
-			if err := result.Resolve(resolve.CanonicalPath(appName, key)); err != nil {
+		apps := []string{app}
+		if app == "" {
+			apps = doc.AppNames(env)
+		}
+		for _, appName := range apps {
+			if appName == "" {
+				continue
+			}
+			if app == "" && appHasUndecryptableValue(doc, env, appName, identities) {
+				continue
+			}
+			result, err := resolve.Env(resolved, appName, identities)
+			if err != nil {
 				return err
 			}
-		}
-		if errs := cinschema.ValidateResult(schemas, env, appName, result); len(errs) > 0 {
-			return fmt.Errorf("schema validation failed: %s", errs[0].Err)
+			for _, key := range result.AppKeys() {
+				if err := result.Resolve(resolve.CanonicalPath(appName, key)); err != nil {
+					return err
+				}
+			}
+			if errs := cinschema.ValidateResult(schemas, env, appName, result); len(errs) > 0 {
+				return fmt.Errorf("schema validation failed: %s", errs[0].Err)
+			}
 		}
 	}
 	return nil
 }
 
-func validateEditableAppTemplates(resolved *yaml.Node, app string, identities []age.Identity, entries map[string]editEntry) error {
-	result, err := resolve.Env(resolved, app, identities)
-	if err != nil {
-		return err
-	}
-	for key := range entries {
-		if err := result.Resolve(resolve.CanonicalPath(app, key)); err != nil {
-			return err
+func appHasUndecryptableValue(doc *config.Document, env, app string, identities []age.Identity) bool {
+	for _, ref := range doc.ValueRefs() {
+		if ref.Env != env || ref.App != app {
+			continue
+		}
+		_, _, decryptable, err := editablePlaintext(ref.Raw, strings.Join(ref.Path, "."), identities)
+		if err != nil || !decryptable {
+			return true
 		}
 	}
-	return nil
+	return false
 }
 
 func editCommand() ([]string, error) {
@@ -1540,64 +1654,6 @@ func runEditor(editor []string, path string, stdin io.Reader, stdout io.Writer, 
 		return errors.New("edit cancelled")
 	}
 	return nil
-}
-
-func sortedEditKeys(values map[string]editEntry) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-func sortedValuePaths(values map[string]*resolve.Value) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-func sortedAppKeys[T any](values map[string]T) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-func sessionHasEditableValues(session *editSession) bool {
-	if len(session.Values) > 0 || len(session.Options) > 0 {
-		return true
-	}
-	for _, values := range session.Apps {
-		if len(values) > 0 {
-			return true
-		}
-	}
-	return false
-}
-
-func appValuePath(path string) (string, string, bool) {
-	rest := strings.TrimPrefix(path, "apps.")
-	parts := strings.SplitN(rest, ".values.", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", false
-	}
-	return parts[0], parts[1], true
-}
-
-func appHasOmittedValue(session *editSession, env, app string) bool {
-	prefix := strings.Join([]string{"envs", env, "apps", app, "values"}, ".") + "."
-	for _, path := range session.Omitted {
-		if strings.HasPrefix(path, prefix) {
-			return true
-		}
-	}
-	return false
 }
 
 func mapNode(key string, value *yaml.Node) *yaml.Node {
@@ -1893,16 +1949,26 @@ func targetPath(env, app, key string) ([]string, error) {
 	if env == "" {
 		return nil, errors.New("environment is required")
 	}
-	if optionPath, ok := config.OptionPath(key); ok {
-		if app != "" {
-			return nil, errors.New("option writes do not use -a")
+	if app != "" {
+		if strings.Contains(key, ".") {
+			return nil, errors.New("app value key must not contain dots when using -a")
 		}
-		return append([]string{"envs", env, "options"}, optionPath...), nil
+		return []string{"envs", env, "apps", app, "values", key}, nil
 	}
-	if app == "" {
-		return nil, errors.New("app value writes require -a <app>")
+	parts := strings.Split(key, ".")
+	for _, part := range parts {
+		if part == "" {
+			return nil, fmt.Errorf("invalid path: %s", key)
+		}
 	}
-	return []string{"envs", env, "apps", app, "values", key}, nil
+	return append([]string{"envs", env}, parts...), nil
+}
+
+func secretPath(path []string) bool {
+	if len(path) >= 4 && path[0] == "envs" && path[2] == "options" {
+		return true
+	}
+	return len(path) == 6 && path[0] == "envs" && path[2] == "apps" && path[4] == "values"
 }
 
 func currentUser(flag string) (string, error) {

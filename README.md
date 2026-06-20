@@ -27,6 +27,7 @@ Set root config for an environment:
 ```bash
 cin set -e dev options.postgres.host postgres
 cin set -e dev options.postgres.port 5432
+cin set -e dev extends base
 ```
 
 Read without leaking plaintext:
@@ -41,10 +42,17 @@ Print plaintext only when needed:
 cin get -e dev options.postgres.host --show
 ```
 
-Edit environment config in a secure temp file:
+Edit the config in a secure temp file:
+
+```bash
+cin edit
+```
+
+Scope editing when you only want one environment or app:
 
 ```bash
 cin edit -e dev
+cin edit -e dev -a api
 ```
 
 ## App Values
@@ -53,6 +61,7 @@ App values are injected as environment variables.
 
 ```bash
 cin set -e dev -a api DATABASE_URL 'postgres://{{ .options.postgres.host }}:{{ .options.postgres.port }}/api'
+cin set -e dev apps.api.values.REDIS_URL redis://localhost:6379
 cin run -e dev -a api -- pnpm dev
 ```
 
