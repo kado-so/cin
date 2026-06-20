@@ -667,19 +667,51 @@ func newExplainCommand(stdout io.Writer, filePath *string, localFile *string, no
 			if !ok {
 				return missingValueError(doc, env, app, key)
 			}
+			localDoc, err := loadLocalConfig(*localFile, *noLocal)
+			if err != nil {
+				return err
+			}
+			layers, err := explainLayers(doc, localDoc, env, strings.Split(canonical, "."))
+			if err != nil {
+				return err
+			}
+			source := "unknown"
+			if last, ok := finalLayer(layers); ok {
+				source = last.displayPath()
+			}
 
 			kind := "encrypted scalar"
 			if value.Kind == envelope.Template {
 				kind = "encrypted template"
 			}
 			fmt.Fprintln(stdout, key)
-			fmt.Fprintf(stdout, "  source: envs.%s.%s\n", env, canonical)
+			fmt.Fprintf(stdout, "  source: %s\n", source)
 			fmt.Fprintf(stdout, "  kind: %s\n", kind)
 			fmt.Fprintf(stdout, "  recipientSet: %s\n", value.RecipientSet)
+			if len(layers) > 0 {
+				fmt.Fprintln(stdout, "  layers:")
+				for i, layer := range layers {
+					status := "overridden"
+					if i == len(layers)-1 {
+						status = "active"
+					}
+					fmt.Fprintf(stdout, "    %s %s %s\n", layer.scope(env), layer.displayPath(), status)
+				}
+			}
 			if len(value.References) > 0 {
 				fmt.Fprintln(stdout, "  references:")
 				for _, ref := range value.References {
-					fmt.Fprintf(stdout, "    %s ok secret\n", displayRef(app, ref))
+					refLayers, err := explainLayers(doc, localDoc, env, strings.Split(ref, "."))
+					if err != nil {
+						return err
+					}
+					refSource := "unknown"
+					refScope := "unknown"
+					if layer, ok := finalLayer(refLayers); ok {
+						refSource = layer.displayPath()
+						refScope = layer.scope(env)
+					}
+					fmt.Fprintf(stdout, "    %s ok secret source: %s %s\n", displayRef(app, ref), refScope, refSource)
 				}
 			}
 			fmt.Fprintln(stdout, "  result: [secret]")
@@ -1725,6 +1757,88 @@ func resolvedEnv(doc *config.Document, localFile string, noLocal bool, env strin
 		return nil, err
 	}
 	return config.MergeEnv(resolved, localResolved), nil
+}
+
+type explainLayer struct {
+	Env       string
+	Path      []string
+	FromLocal bool
+}
+
+func explainLayers(doc, localDoc *config.Document, env string, path []string) ([]explainLayer, error) {
+	layers, err := collectExplainLayers(doc, env, path, false, nil)
+	if err != nil {
+		return nil, err
+	}
+	if localDoc == nil || !localDoc.HasEnv(env) {
+		return layers, nil
+	}
+	localLayers, err := collectExplainLayers(localDoc, env, path, true, nil)
+	if err != nil {
+		return nil, err
+	}
+	return append(layers, localLayers...), nil
+}
+
+func collectExplainLayers(doc *config.Document, env string, path []string, fromLocal bool, stack []string) ([]explainLayer, error) {
+	for i, name := range stack {
+		if name == env {
+			cycle := append(append([]string{}, stack[i:]...), env)
+			return nil, fmt.Errorf("inheritance cycle detected: %s", strings.Join(cycle, " -> "))
+		}
+	}
+	if !doc.HasEnv(env) {
+		if len(stack) > 0 {
+			return nil, fmt.Errorf("environment parent not found: %s", env)
+		}
+		return nil, fmt.Errorf("environment not found: %s", env)
+	}
+
+	var layers []explainLayer
+	parents, err := doc.EnvExtends(env)
+	if err != nil {
+		return nil, fmt.Errorf("invalid extends for %s: %w", env, err)
+	}
+	for _, parent := range parents {
+		parentLayers, err := collectExplainLayers(doc, parent, path, fromLocal, append(stack, env))
+		if err != nil {
+			return nil, err
+		}
+		layers = append(layers, parentLayers...)
+	}
+	if _, ok := doc.GetScalar(append([]string{"envs", env}, path...)); ok {
+		layers = append(layers, explainLayer{
+			Env:       env,
+			Path:      append([]string(nil), path...),
+			FromLocal: fromLocal,
+		})
+	}
+	return layers, nil
+}
+
+func finalLayer(layers []explainLayer) (explainLayer, bool) {
+	if len(layers) == 0 {
+		return explainLayer{}, false
+	}
+	return layers[len(layers)-1], true
+}
+
+func (l explainLayer) displayPath() string {
+	path := strings.Join(append([]string{"envs", l.Env}, l.Path...), ".")
+	if l.FromLocal {
+		return "local " + path
+	}
+	return path
+}
+
+func (l explainLayer) scope(selectedEnv string) string {
+	if l.FromLocal {
+		return "local override"
+	}
+	if l.Env == selectedEnv {
+		return "selected env"
+	}
+	return "parent env"
 }
 
 func loadLocalConfig(path string, disabled bool) (*config.Document, error) {

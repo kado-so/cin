@@ -577,6 +577,156 @@ func TestExplainRedactsResultAndShowsDependencies(t *testing.T) {
 	}
 }
 
+func TestExplainShowsParentEnvOverrideProvenance(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "base", "options.postgres.host", "base-secret"})
+	runOK(t, []string{"-f", path, "set", "-e", "shared", "options.postgres.host", "shared-secret"})
+	setExtends(t, path, "shared", "base")
+	setExtends(t, path, "dev", "shared")
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "explain", "-e", "dev", "options.postgres.host"})
+	if code != 0 {
+		t.Fatalf("explain failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	for _, want := range []string{
+		"source: envs.shared.options.postgres.host",
+		"parent env envs.base.options.postgres.host overridden",
+		"parent env envs.shared.options.postgres.host active",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected explain output to contain %q, got %q", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "base-secret") || strings.Contains(stdout, "shared-secret") {
+		t.Fatalf("explain leaked plaintext: %q", stdout)
+	}
+}
+
+func TestExplainShowsRightmostParentPrecedence(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "shared", "options.region", "left-secret"})
+	runOK(t, []string{"-f", path, "set", "-e", "team", "options.region", "right-secret"})
+	setExtendsList(t, path, "dev", "shared", "team")
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "explain", "-e", "dev", "options.region"})
+	if code != 0 {
+		t.Fatalf("explain failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	for _, want := range []string{
+		"source: envs.team.options.region",
+		"parent env envs.shared.options.region overridden",
+		"parent env envs.team.options.region active",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected explain output to contain %q, got %q", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "left-secret") || strings.Contains(stdout, "right-secret") {
+		t.Fatalf("explain leaked plaintext: %q", stdout)
+	}
+}
+
+func TestExplainShowsSelectedEnvOverrideProvenance(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "shared", "options.postgres.host", "shared-secret"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "options.postgres.host", "dev-secret"})
+	setExtends(t, path, "dev", "shared")
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "explain", "-e", "dev", "options.postgres.host"})
+	if code != 0 {
+		t.Fatalf("explain failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	for _, want := range []string{
+		"source: envs.dev.options.postgres.host",
+		"parent env envs.shared.options.postgres.host overridden",
+		"selected env envs.dev.options.postgres.host active",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected explain output to contain %q, got %q", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "shared-secret") || strings.Contains(stdout, "dev-secret") {
+		t.Fatalf("explain leaked plaintext: %q", stdout)
+	}
+}
+
+func TestExplainShowsLocalOverrideProvenance(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	dir := t.TempDir()
+	chdir(t, dir)
+
+	runOK(t, []string{"init", "vaishnav"})
+	runOK(t, []string{"set", "-e", "dev", "options.postgres.host", "shared-secret"})
+	runOK(t, []string{"-f", "configs.local.secret.yaml", "init", "local"})
+	runOK(t, []string{"-f", "configs.local.secret.yaml", "set", "-e", "dev", "options.postgres.host", "local-secret"})
+
+	stdout, stderr, code := runCLI([]string{"--user", "vaishnav", "explain", "-e", "dev", "options.postgres.host"})
+	if code != 0 {
+		t.Fatalf("explain failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	for _, want := range []string{
+		"source: local envs.dev.options.postgres.host",
+		"selected env envs.dev.options.postgres.host overridden",
+		"local override local envs.dev.options.postgres.host active",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected explain output to contain %q, got %q", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "shared-secret") || strings.Contains(stdout, "local-secret") {
+		t.Fatalf("explain leaked plaintext: %q", stdout)
+	}
+}
+
+func TestExplainShowsTemplateReferenceProvenance(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	dir := t.TempDir()
+	chdir(t, dir)
+
+	runOK(t, []string{"init", "vaishnav"})
+	runOK(t, []string{"set", "-e", "shared", "options.postgres.user", "parent-user"})
+	runOK(t, []string{"set", "-e", "dev", "options.postgres.host", "selected-host"})
+	runOK(t, []string{"set", "-e", "shared", "-a", "api", "DATABASE_URL", "postgres://{{ .options.postgres.user }}@{{ .options.postgres.host }}/api"})
+	setExtends(t, "configs.secret.yaml", "dev", "shared")
+	runOK(t, []string{"-f", "configs.local.secret.yaml", "init", "local"})
+	runOK(t, []string{"-f", "configs.local.secret.yaml", "set", "-e", "dev", "options.postgres.host", "local-host"})
+
+	stdout, stderr, code := runCLI([]string{"--user", "vaishnav", "explain", "-e", "dev", "-a", "api", "DATABASE_URL"})
+	if code != 0 {
+		t.Fatalf("explain failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	for _, want := range []string{
+		"source: envs.shared.apps.api.values.DATABASE_URL",
+		"options.postgres.user ok secret source: parent env envs.shared.options.postgres.user",
+		"options.postgres.host ok secret source: local override local envs.dev.options.postgres.host",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("expected explain output to contain %q, got %q", want, stdout)
+		}
+	}
+	for _, leaked := range []string{"parent-user", "selected-host", "local-host", "postgres://"} {
+		if strings.Contains(stdout, leaked) {
+			t.Fatalf("explain leaked plaintext %q: %q", leaked, stdout)
+		}
+	}
+}
+
 func TestRunInjectsSelectedAppValues(t *testing.T) {
 	identity := testIdentity(t)
 	t.Setenv("CIN_AGE_KEY", identity.String())
@@ -1850,6 +2000,36 @@ func fakePager(t *testing.T, script string) string {
 func setExtends(t *testing.T, path string, env string, parent string) {
 	t.Helper()
 	setRawScalar(t, path, []string{"envs", env, "extends"}, parent)
+}
+
+func setExtendsList(t *testing.T, path string, env string, parents ...string) {
+	t.Helper()
+	var root map[string]any
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		t.Fatalf("parse config: %v", err)
+	}
+	envs, ok := root["envs"].(map[string]any)
+	if !ok {
+		envs = map[string]any{}
+		root["envs"] = envs
+	}
+	envNode, ok := envs[env].(map[string]any)
+	if !ok {
+		envNode = map[string]any{}
+		envs[env] = envNode
+	}
+	envNode["extends"] = parents
+	data, err = yaml.Marshal(root)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
 }
 
 func setDefaultEnv(t *testing.T, path string, env string) {
