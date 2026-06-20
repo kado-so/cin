@@ -79,6 +79,14 @@ func CanonicalPath(app, key string) string {
 	return "apps." + app + ".values." + key
 }
 
+func TemplateReferences(text string, app string) ([]string, error) {
+	plan, err := parseTemplate(text, app)
+	if err != nil {
+		return nil, err
+	}
+	return append([]string(nil), plan.refs...), nil
+}
+
 func (r *Result) AppKeys() []string {
 	prefix := "apps." + r.App + ".values."
 	keys := make([]string, 0)

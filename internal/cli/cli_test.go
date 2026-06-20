@@ -801,6 +801,191 @@ func TestSecureTempFileUsesRestrictivePermissionsAndCleansUp(t *testing.T) {
 	}
 }
 
+func TestEditChangesValueEncryptsAndPreservesUnchangedValue(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "old-token"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "UNCHANGED", "keep-me"})
+	unchangedBefore := encryptedScalar(t, path, []string{"envs", "dev", "apps", "api", "values", "UNCHANGED"})
+	tokenBefore := encryptedScalar(t, path, []string{"envs", "dev", "apps", "api", "values", "API_TOKEN"})
+
+	t.Setenv("VISUAL", fakeEditor(t, `cat > "$1" <<'EOF'
+values:
+  API_TOKEN: new-token
+  UNCHANGED: keep-me
+EOF
+`))
+	t.Setenv("EDITOR", "")
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "edit", "-e", "dev", "-a", "api"})
+	if code != 0 {
+		t.Fatalf("edit failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "" || stderr != "" {
+		t.Fatalf("expected quiet edit, stdout=%q stderr=%q", stdout, stderr)
+	}
+	if got := encryptedScalar(t, path, []string{"envs", "dev", "apps", "api", "values", "UNCHANGED"}); got != unchangedBefore {
+		t.Fatal("unchanged encrypted value was not preserved byte-identical")
+	}
+	tokenAfter := encryptedScalar(t, path, []string{"envs", "dev", "apps", "api", "values", "API_TOKEN"})
+	if tokenAfter == tokenBefore {
+		t.Fatal("changed value was not re-encrypted")
+	}
+	if _, err := envelope.Parse(tokenAfter); err != nil {
+		t.Fatalf("changed value is not encrypted: %v", err)
+	}
+	stdout, stderr, code = runCLI([]string{"-f", path, "--user", "vaishnav", "get", "-e", "dev", "-a", "api", "API_TOKEN", "--show"})
+	if code != 0 {
+		t.Fatalf("get edited value failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if got := strings.TrimSpace(stdout); got != "API_TOKEN = new-token" {
+		t.Fatalf("unexpected edited value: %q", got)
+	}
+}
+
+func TestEditCanChangeReferencedOption(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "options.postgres.host", "db-old"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "DATABASE_URL", "postgres://{{ .options.postgres.host }}/api"})
+
+	t.Setenv("VISUAL", fakeEditor(t, `cat > "$1" <<'EOF'
+values:
+  DATABASE_URL: postgres://{{ .options.postgres.host }}/api
+options:
+  postgres:
+    host: db-new
+EOF
+`))
+	t.Setenv("EDITOR", "")
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "edit", "-e", "dev", "-a", "api"})
+	if code != 0 {
+		t.Fatalf("edit option failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	stdout, stderr, code = runCLI([]string{"-f", path, "--user", "vaishnav", "render", "-e", "dev", "-a", "api", "--show"})
+	if code != 0 {
+		t.Fatalf("render edited option failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if got := strings.TrimSpace(stdout); got != "DATABASE_URL=postgres://db-new/api" {
+		t.Fatalf("unexpected rendered value: %q", got)
+	}
+}
+
+func TestEditRejectsSchemaFailureWithoutSaving(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	dir := t.TempDir()
+	chdir(t, dir)
+	if err := os.MkdirAll(filepath.Join(dir, "apps", "api"), 0o700); err != nil {
+		t.Fatalf("mkdir schema dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "apps", "api", "cin.schema.yaml"), []byte(`
+app: api
+values:
+  type: object
+  properties:
+    PORT:
+      type: number
+`), 0o600); err != nil {
+		t.Fatalf("write schema: %v", err)
+	}
+	runOK(t, []string{"init", "vaishnav"})
+	setConfigSchemas(t, "configs.secret.yaml", "apps/*/cin.schema.yaml")
+	runOK(t, []string{"set", "-e", "dev", "-a", "api", "PORT", "3000"})
+	before := encryptedScalar(t, "configs.secret.yaml", []string{"envs", "dev", "apps", "api", "values", "PORT"})
+
+	t.Setenv("VISUAL", fakeEditor(t, `cat > "$1" <<'EOF'
+values:
+  PORT: not-a-number
+EOF
+`))
+	t.Setenv("EDITOR", "")
+
+	stdout, stderr, code := runCLI([]string{"--user", "vaishnav", "edit", "-e", "dev", "-a", "api"})
+	if code != 2 {
+		t.Fatalf("expected schema failure, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("expected no stdout, got %q", stdout)
+	}
+	if !strings.Contains(stderr, "schema validation failed") || !strings.Contains(stderr, "PORT") {
+		t.Fatalf("expected schema error, got %q", stderr)
+	}
+	if strings.Contains(stderr, "not-a-number") {
+		t.Fatalf("schema error leaked plaintext: %q", stderr)
+	}
+	if got := encryptedScalar(t, "configs.secret.yaml", []string{"envs", "dev", "apps", "api", "values", "PORT"}); got != before {
+		t.Fatal("schema failure saved edited value")
+	}
+}
+
+func TestEditRejectsMalformedInputWithoutSaving(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "old-token"})
+	before := encryptedScalar(t, path, []string{"envs", "dev", "apps", "api", "values", "API_TOKEN"})
+
+	t.Setenv("VISUAL", fakeEditor(t, `printf 'values: [' > "$1"`))
+	t.Setenv("EDITOR", "")
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "edit", "-e", "dev", "-a", "api"})
+	if code != 2 {
+		t.Fatalf("expected malformed edit failure, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("expected no stdout, got %q", stdout)
+	}
+	if !strings.Contains(stderr, "edited document is not valid YAML") {
+		t.Fatalf("expected malformed YAML error, got %q", stderr)
+	}
+	if got := encryptedScalar(t, path, []string{"envs", "dev", "apps", "api", "values", "API_TOKEN"}); got != before {
+		t.Fatal("malformed edit input saved changes")
+	}
+}
+
+func TestEditCancellationDoesNotSave(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "old-token"})
+	before := encryptedScalar(t, path, []string{"envs", "dev", "apps", "api", "values", "API_TOKEN"})
+
+	t.Setenv("VISUAL", fakeEditor(t, `cat > "$1" <<'EOF'
+values:
+  API_TOKEN: new-token
+EOF
+exit 1
+`))
+	t.Setenv("EDITOR", "")
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "edit", "-e", "dev", "-a", "api"})
+	if code != 2 {
+		t.Fatalf("expected cancellation, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("expected no stdout, got %q", stdout)
+	}
+	if !strings.Contains(stderr, "edit cancelled") {
+		t.Fatalf("expected cancellation error, got %q", stderr)
+	}
+	if got := encryptedScalar(t, path, []string{"envs", "dev", "apps", "api", "values", "API_TOKEN"}); got != before {
+		t.Fatal("cancelled edit saved changes")
+	}
+}
+
 func TestDoctorReportsSchemaAndPlaintextDiagnostics(t *testing.T) {
 	dir := t.TempDir()
 	chdir(t, dir)
@@ -1044,6 +1229,15 @@ func runCLIInput(args []string, input string) (string, string, int) {
 		return stdout.String(), stderr.String(), 2
 	}
 	return stdout.String(), stderr.String(), 0
+}
+
+func fakeEditor(t *testing.T, script string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "editor.sh")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script+"\n"), 0o700); err != nil {
+		t.Fatalf("write fake editor: %v", err)
+	}
+	return path
 }
 
 func setExtends(t *testing.T, path string, env string, parent string) {
