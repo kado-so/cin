@@ -298,6 +298,7 @@ func newSetCommand(filePath *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			env = effectiveEnv(doc, env)
 			key := args[0]
 			value := ""
 			if prompt {
@@ -371,6 +372,7 @@ func newGetCommand(stdout io.Writer, filePath *string, localFile *string, noLoca
 			if err != nil {
 				return err
 			}
+			env = effectiveEnv(doc, env)
 			key := args[0]
 			path, err := targetPath(env, app, key)
 			if err != nil {
@@ -423,9 +425,6 @@ func newRunCommand(stdout io.Writer, stderr io.Writer, filePath *string, localFi
 		Short: "Run a command with resolved app config",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if env == "" {
-				return errors.New("environment is required")
-			}
 			if app == "" {
 				return errors.New("cin run requires -a <app>\nfix: rerun with -a api")
 			}
@@ -460,9 +459,6 @@ func newExportCommand(stdout io.Writer, filePath *string, localFile *string, noL
 		Short: "Export resolved app config",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if env == "" {
-				return errors.New("environment is required")
-			}
 			if app == "" {
 				return errors.New("cin export requires -a <app>\nfix: rerun with -a api")
 			}
@@ -501,9 +497,6 @@ func newEditCommand(filePath *string, user *string) *cobra.Command {
 		Short: "Edit app config values in a secure temp file",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if env == "" {
-				return errors.New("environment is required")
-			}
 			if app == "" {
 				return errors.New("app is required")
 			}
@@ -515,6 +508,7 @@ func newEditCommand(filePath *string, user *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			env = effectiveEnv(doc, env)
 			current, err := currentUser(*user)
 			if err != nil {
 				return err
@@ -586,9 +580,6 @@ func newRenderCommand(stdout io.Writer, filePath *string, localFile *string, noL
 		Short: "Render resolved app config",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if env == "" {
-				return errors.New("environment is required")
-			}
 			if app == "" {
 				return errors.New("app is required")
 			}
@@ -596,6 +587,7 @@ func newRenderCommand(stdout io.Writer, filePath *string, localFile *string, noL
 			if err != nil {
 				return err
 			}
+			env = effectiveEnv(doc, env)
 			result, err := resolveResult(doc, *localFile, *noLocal, *user, env, app)
 			if err != nil {
 				return err
@@ -636,6 +628,7 @@ func newExplainCommand(stdout io.Writer, filePath *string, localFile *string, no
 			if err != nil {
 				return err
 			}
+			env = effectiveEnv(doc, env)
 			key := args[0]
 			path, err := targetPath(env, app, key)
 			if err != nil {
@@ -729,6 +722,7 @@ func loadConfig(path string) (*config.Document, error) {
 }
 
 func resolveResult(doc *config.Document, localFile string, noLocal bool, user string, env string, app string) (*resolve.Result, error) {
+	env = effectiveEnv(doc, env)
 	resolved, err := resolvedEnv(doc, localFile, noLocal, env)
 	if err != nil {
 		return nil, err
@@ -749,6 +743,7 @@ func resolvedAppEnv(filePath string, localFile string, noLocal bool, user string
 	if err != nil {
 		return nil, err
 	}
+	env = effectiveEnv(doc, env)
 	result, err := resolveResult(doc, localFile, noLocal, user, env, app)
 	if err != nil {
 		return nil, err
@@ -1429,6 +1424,16 @@ func loadLocalConfig(path string, disabled bool) (*config.Document, error) {
 		return nil, fmt.Errorf("local config file not found: %s", path)
 	}
 	return nil, err
+}
+
+func effectiveEnv(doc *config.Document, env string) string {
+	if env != "" {
+		return env
+	}
+	if defaultEnv := doc.DefaultEnv(); defaultEnv != "" {
+		return defaultEnv
+	}
+	return "dev"
 }
 
 func targetPath(env, app, key string) ([]string, error) {

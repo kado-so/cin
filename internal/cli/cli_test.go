@@ -181,6 +181,118 @@ func TestGetAppliesLocalOverrideAtHighestPrecedence(t *testing.T) {
 	}
 }
 
+func TestEnvDefaultResolutionUsesExplicitEnv(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	setDefaultEnv(t, path, "prod")
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "dev-token"})
+	runOK(t, []string{"-f", path, "set", "-e", "prod", "-a", "api", "API_TOKEN", "prod-token"})
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "get", "-e", "dev", "-a", "api", "API_TOKEN", "--show"})
+	if code != 0 {
+		t.Fatalf("get explicit env failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if got := strings.TrimSpace(stdout); got != "API_TOKEN = dev-token" {
+		t.Fatalf("expected explicit env value, got %q", got)
+	}
+}
+
+func TestEnvDefaultResolutionUsesCinDefaultEnv(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	setDefaultEnv(t, path, "prod")
+	runOK(t, []string{"-f", path, "set", "-a", "api", "API_TOKEN", "prod-token"})
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "get", "-a", "api", "API_TOKEN", "--show"})
+	if code != 0 {
+		t.Fatalf("get default env failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if got := strings.TrimSpace(stdout); got != "API_TOKEN = prod-token" {
+		t.Fatalf("expected cin.defaults.env value, got %q", got)
+	}
+}
+
+func TestEnvDefaultResolutionFallsBackToDev(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-a", "api", "API_TOKEN", "dev-token"})
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "get", "-a", "api", "API_TOKEN", "--show"})
+	if code != 0 {
+		t.Fatalf("get fallback env failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if got := strings.TrimSpace(stdout); got != "API_TOKEN = dev-token" {
+		t.Fatalf("expected fallback dev value, got %q", got)
+	}
+}
+
+func TestEnvDefaultResolutionMissingEnvNamesResolvedDefault(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	setDefaultEnv(t, path, "prod")
+
+	_, stderr, code := runCLI([]string{"-f", path, "get", "options.postgres.host"})
+	if code != 2 {
+		t.Fatalf("expected missing default env failure, got code=%d stderr=%q", code, stderr)
+	}
+	if !strings.Contains(stderr, "environment not found: prod") {
+		t.Fatalf("expected missing env to name resolved default, got %q", stderr)
+	}
+}
+
+func TestEnvDefaultResolutionMissingAppNamesResolvedDefault(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	setDefaultEnv(t, path, "prod")
+	runOK(t, []string{"-f", path, "set", "-e", "prod", "-a", "web", "URL", "https://example.test"})
+
+	_, stderr, code := runCLI([]string{"-f", path, "get", "-a", "api", "URL"})
+	if code != 2 {
+		t.Fatalf("expected missing app failure, got code=%d stderr=%q", code, stderr)
+	}
+	if !strings.Contains(stderr, "app not found in env prod: api") {
+		t.Fatalf("expected missing app to name resolved default env, got %q", stderr)
+	}
+}
+
+func TestEnvDefaultResolutionLoadsLocalOverrideForDefaultedEnv(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	dir := t.TempDir()
+	chdir(t, dir)
+
+	runOK(t, []string{"init", "vaishnav"})
+	setDefaultEnv(t, "configs.secret.yaml", "prod")
+	runOK(t, []string{"set", "-e", "prod", "-a", "api", "API_TOKEN", "shared-token"})
+
+	runOK(t, []string{"-f", "configs.local.secret.yaml", "init", "local"})
+	runOK(t, []string{"-f", "configs.local.secret.yaml", "set", "-e", "prod", "-a", "api", "API_TOKEN", "local-token"})
+
+	stdout, stderr, code := runCLI([]string{"--user", "vaishnav", "get", "-a", "api", "API_TOKEN", "--show"})
+	if code != 0 {
+		t.Fatalf("get default env with local override failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if got := strings.TrimSpace(stdout); got != "API_TOKEN = local-token" {
+		t.Fatalf("expected local override for defaulted env, got %q", got)
+	}
+}
+
 func TestGetShowRequiresExplicitCurrentUser(t *testing.T) {
 	identity := testIdentity(t)
 	t.Setenv("CIN_AGE_KEY", identity.String())
@@ -468,16 +580,6 @@ func TestRunRequiresApp(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "cin run requires -a <app>") {
 		t.Fatalf("expected app guidance, got %q", stderr)
-	}
-}
-
-func TestRunRequiresEnv(t *testing.T) {
-	stdout, stderr, code := runCLI([]string{"run", "-a", "api", "--", "/usr/bin/true"})
-	if code != 2 {
-		t.Fatalf("expected missing env failure, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
-	}
-	if !strings.Contains(stderr, "environment is required") {
-		t.Fatalf("expected env guidance, got %q", stderr)
 	}
 }
 
@@ -1049,6 +1151,37 @@ envs:
 	}
 }
 
+func TestDoctorWithoutEnvScansAllEnvsWhenDefaultEnvIsSet(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	if err := os.WriteFile(path, []byte(`
+cin:
+  version: 1
+  defaults:
+    env: prod
+envs:
+  prod: {}
+  dev:
+    options:
+      postgres:
+        host: plaintext
+`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "doctor"})
+	if code != 1 {
+		t.Fatalf("expected doctor to report dev issue, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "envs.dev.options.postgres.host is plaintext value") {
+		t.Fatalf("expected doctor without -e to scan dev despite prod default, got %q", stdout)
+	}
+
+	stdout, stderr, code = runCLI([]string{"-f", path, "doctor", "-e", "prod"})
+	if code != 0 {
+		t.Fatalf("expected doctor -e prod to ignore dev issue, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
 func TestUsersApproveRekeysAndPreservesUnaffectedValues(t *testing.T) {
 	vaishnav := testIdentity(t)
 	alice := testIdentity(t)
@@ -1243,6 +1376,11 @@ func fakeEditor(t *testing.T, script string) string {
 func setExtends(t *testing.T, path string, env string, parent string) {
 	t.Helper()
 	setRawScalar(t, path, []string{"envs", env, "extends"}, parent)
+}
+
+func setDefaultEnv(t *testing.T, path string, env string) {
+	t.Helper()
+	setRawScalar(t, path, []string{"cin", "defaults", "env"}, env)
 }
 
 func addRecipientSet(t *testing.T, path string, set string, users ...string) {

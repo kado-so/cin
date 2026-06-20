@@ -415,6 +415,11 @@ func (d *Document) EnvDefaultRecipientSet(env string) string {
 	return value
 }
 
+func (d *Document) DefaultEnv() string {
+	value, _ := d.GetScalar([]string{"cin", "defaults", "env"})
+	return value
+}
+
 func (d *Document) HasPath(path []string) bool {
 	return d.lookup(path) != nil
 }
