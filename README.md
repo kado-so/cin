@@ -118,8 +118,9 @@ cin run --no-local -e dev -a api -- pnpm dev
 
 ## Environment
 
-`cin` reads `CIN_*` defaults from `.env` in the current directory and Git root
-without overriding real process environment variables.
+`cin` reads CLI defaults from `.env` in the current directory and Git root
+without overriding real process environment variables. Supported keys are
+`CIN_*`, `EDITOR`, `HOME`, `PAGER`, and `VISUAL`.
 
 Useful variables:
 

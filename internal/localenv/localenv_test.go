@@ -25,6 +25,28 @@ func TestLoadCurrentDirectoryDotenv(t *testing.T) {
 	}
 }
 
+func TestLoadCliEnvVarsFromDotenv(t *testing.T) {
+	dir := t.TempDir()
+	chdir(t, dir)
+	restoreEnv(t, "EDITOR", "HOME", "PAGER", "VISUAL")
+	unsetEnv(t, "EDITOR", "HOME", "PAGER", "VISUAL")
+	writeFile(t, filepath.Join(dir, ".env"), "EDITOR=ed\nHOME=/tmp/cin-home\nPAGER=cat\nVISUAL=vim\n")
+
+	if err := Load(); err != nil {
+		t.Fatalf("load .env: %v", err)
+	}
+	for key, want := range map[string]string{
+		"EDITOR": "ed",
+		"HOME":   "/tmp/cin-home",
+		"PAGER":  "cat",
+		"VISUAL": "vim",
+	} {
+		if got := os.Getenv(key); got != want {
+			t.Fatalf("expected %s from .env, got %q", key, got)
+		}
+	}
+}
+
 func TestLoadGitRootDotenv(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, filepath.Join(root, ".env"), "CIN_USER=root\n")

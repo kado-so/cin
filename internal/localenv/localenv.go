@@ -9,8 +9,15 @@ import (
 	"unicode"
 )
 
-// Load applies CIN_* defaults from local .env files without overriding the
-// real process environment.
+var allowedKeys = map[string]bool{
+	"EDITOR": true,
+	"HOME":   true,
+	"PAGER":  true,
+	"VISUAL": true,
+}
+
+// Load applies CLI defaults from local .env files without overriding the real
+// process environment.
 func Load() error {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -32,7 +39,7 @@ func Load() error {
 
 	for _, values := range envs {
 		for key, value := range values {
-			if !strings.HasPrefix(key, "CIN_") {
+			if !allowedKey(key) {
 				continue
 			}
 			if _, ok := os.LookupEnv(key); !ok {
@@ -43,6 +50,10 @@ func Load() error {
 		}
 	}
 	return nil
+}
+
+func allowedKey(key string) bool {
+	return strings.HasPrefix(key, "CIN_") || allowedKeys[key]
 }
 
 func discoverFiles(cwd string) ([]string, error) {
