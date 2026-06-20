@@ -1182,6 +1182,145 @@ envs:
 	}
 }
 
+func TestDoctorHardeningTemplateDiagnostics(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	path := filepath.Join(t.TempDir(), "configs.secret.yaml")
+	runOK(t, []string{"-f", path, "init", "vaishnav"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "HOST", "example.test"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "MISSING", "https://{{ .options.missing.host }}"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "UNKNOWN_APP", "{{ .apps.worker.values.URL }}"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "UNSUPPORTED", "{{ printf \"%s\" .values.HOST }}"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "CYCLE_A", "{{ .values.CYCLE_B }}"})
+	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "CYCLE_B", "{{ .values.CYCLE_A }}"})
+
+	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "doctor", "-e", "dev", "-a", "api"})
+	if code != 1 {
+		t.Fatalf("expected doctor template errors, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	for _, want := range []string{
+		"Templates",
+		"dev/api/CYCLE_A has a template cycle",
+		"fix: break the cycle between template references",
+		"dev/api/MISSING is missing template reference options.missing.host",
+		"fix: set the referenced value or fix the template reference",
+		"dev/api/UNKNOWN_APP references unknown app worker",
+		"fix: add the app values or fix the template reference",
+		"dev/api/UNSUPPORTED uses unsupported template syntax",
+		"fix: use only {{ .options.x }}, {{ .values.X }}, or {{ .apps.app.values.X }} lookups",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("doctor output missing %q:\n%s", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "example.test") || strings.Contains(stderr, "example.test") {
+		t.Fatalf("doctor leaked plaintext: stdout=%q stderr=%q", stdout, stderr)
+	}
+}
+
+func TestDoctorHardeningLocalShapeKeyConsistencyAndDecryptSkip(t *testing.T) {
+	identity := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+	t.Setenv("CIN_USER", "")
+
+	dir := t.TempDir()
+	chdir(t, dir)
+
+	runOK(t, []string{"init", "vaishnav"})
+	runOK(t, []string{"set", "-e", "dev", "-a", "api", "API_TOKEN", "dev-token"})
+	runOK(t, []string{"set", "-e", "prod", "-a", "api", "DATABASE_URL", "prod-url"})
+	if err := os.WriteFile("configs.local.secret.yaml", []byte(`
+cin:
+  users: {}
+note: local-only
+envs:
+  dev: {}
+`), 0o600); err != nil {
+		t.Fatalf("write local config: %v", err)
+	}
+
+	stdout, stderr, code := runCLI([]string{"doctor"})
+	if code != 0 {
+		t.Fatalf("expected warnings/info only, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	for _, want := range []string{
+		"Local overrides",
+		"configs.local.secret.yaml contains top-level cin, which is ignored",
+		"configs.local.secret.yaml contains top-level note, which is ignored",
+		"Values",
+		"prod/api is missing API_TOKEN, which exists in another env for app api",
+		"dev/api is missing DATABASE_URL, which exists in another env for app api",
+		"Runtime",
+		"info decrypt-dependent checks were skipped because no current user is configured",
+		"fix: pass --user <username> or set CIN_USER",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("doctor output missing %q:\n%s", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "dev-token") || strings.Contains(stdout, "prod-url") || strings.Contains(stderr, "dev-token") || strings.Contains(stderr, "prod-url") {
+		t.Fatalf("doctor leaked plaintext: stdout=%q stderr=%q", stdout, stderr)
+	}
+}
+
+func TestDoctorHardeningSchemaAggregationAndRecipientImpact(t *testing.T) {
+	identity := testIdentity(t)
+	alice := testIdentity(t)
+	t.Setenv("CIN_AGE_KEY", identity.String())
+
+	dir := t.TempDir()
+	chdir(t, dir)
+	if err := os.MkdirAll(filepath.Join(dir, "apps", "api"), 0o700); err != nil {
+		t.Fatalf("mkdir schema dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "apps", "api", "cin.schema.yaml"), []byte(`
+app: api
+values:
+  type: object
+  properties:
+    PORT:
+      type: number
+    ENABLED:
+      type: boolean
+`), 0o600); err != nil {
+		t.Fatalf("write schema: %v", err)
+	}
+
+	runOK(t, []string{"init", "vaishnav"})
+	setConfigSchemas(t, "configs.secret.yaml", "apps/*/cin.schema.yaml")
+	runOK(t, []string{"set", "-e", "dev", "-a", "api", "PORT", "not-a-number"})
+	runOK(t, []string{"set", "-e", "dev", "-a", "api", "ENABLED", "not-a-bool"})
+	addRecipientSet(t, "configs.secret.yaml", "prod", "vaishnav")
+	runOK(t, []string{"set", "-e", "prod", "--recipient-set", "prod", "options.prod.secret", "prod-secret"})
+	runOK(t, []string{"users", "add", "alice", "--age", alice.Recipient().String()})
+	addRecipientSet(t, "configs.secret.yaml", "prod", "alice")
+
+	stdout, stderr, code := runCLI([]string{"--user", "vaishnav", "doctor", "-e", "dev", "-a", "api"})
+	if code != 1 {
+		t.Fatalf("expected doctor errors, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	for _, want := range []string{
+		"Users",
+		"error alice is pending and cannot decrypt existing values",
+		"Recipients",
+		"warn approving alice would grant access to 3 values through 2 recipient sets",
+		"Schemas",
+		"PORT",
+		"ENABLED",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("doctor output missing %q:\n%s", want, stdout)
+		}
+	}
+	if strings.Index(stdout, "error alice is pending") > strings.Index(stdout, "warn approving alice") {
+		t.Fatalf("expected errors before warnings:\n%s", stdout)
+	}
+	if strings.Contains(stdout, "not-a-number") || strings.Contains(stdout, "not-a-bool") || strings.Contains(stderr, "not-a-number") || strings.Contains(stderr, "not-a-bool") {
+		t.Fatalf("doctor leaked plaintext: stdout=%q stderr=%q", stdout, stderr)
+	}
+}
+
 func TestUsersApproveRekeysAndPreservesUnaffectedValues(t *testing.T) {
 	vaishnav := testIdentity(t)
 	alice := testIdentity(t)

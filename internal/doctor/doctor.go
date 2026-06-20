@@ -41,6 +41,8 @@ func Run(stdout io.Writer, doc *config.Document, schemas *cinschema.Set, localDo
 	diags = append(diags, inheritanceDiagnostics(doc, opt)...)
 	diags = append(diags, localDiagnostics(localDoc, opt)...)
 	diags = append(diags, schemaDiagnostics(doc, schemas, opt)...)
+	diags = append(diags, keyConsistencyDiagnostics(doc, opt)...)
+	diags = append(diags, decryptSkippedDiagnostics(doc, opt)...)
 	diags = append(diags, runtimeDiagnostics(doc, localDoc, schemas, opt)...)
 	print(stdout, diags)
 	return hasSeverity(diags, "error")
@@ -85,6 +87,17 @@ func userDiagnostics(doc *config.Document) []Diagnostic {
 				Message:  fmt.Sprintf("%s is active but is not present in any recipient set", user.Name),
 				Fix:      fmt.Sprintf("add %s to a recipient set or remove the user", user.Name),
 			})
+		}
+		sets := doc.RecipientSetsForUser(user.Name)
+		if user.Status == "pending" {
+			if count := valueCountForSets(doc, sets); len(sets) > 1 || count >= 10 {
+				out = append(out, Diagnostic{
+					Category: "Recipients",
+					Severity: "warn",
+					Message:  fmt.Sprintf("approving %s would grant access to %d values through %d recipient sets", user.Name, count, len(sets)),
+					Fix:      "review recipient set membership before approving the user",
+				})
+			}
 		}
 	}
 	return out
@@ -182,9 +195,9 @@ func localDiagnostics(localDoc *config.Document, opt Options) []Diagnostic {
 		path = "configs.local.secret.yaml"
 	}
 	var out []Diagnostic
-	for _, p := range [][]string{{"cin", "users"}, {"cin", "recipientSets"}, {"cin", "configSchemas"}} {
-		if localDoc.HasPath(p) {
-			out = append(out, Diagnostic{Category: "Local overrides", Severity: "warn", Message: fmt.Sprintf("%s contains %s, which is ignored", path, strings.Join(p, ".")), Fix: "move cin metadata to the main config file"})
+	for _, key := range localDoc.TopLevelKeys() {
+		if key != "envs" {
+			out = append(out, Diagnostic{Category: "Local overrides", Severity: "warn", Message: fmt.Sprintf("%s contains top-level %s, which is ignored", path, key), Fix: "local override files should contain only envs"})
 		}
 	}
 	return out
@@ -239,6 +252,72 @@ func schemaDiagnostics(doc *config.Document, schemas *cinschema.Set, opt Options
 	return out
 }
 
+func keyConsistencyDiagnostics(doc *config.Document, opt Options) []Diagnostic {
+	envs := targetEnvs(doc, opt.Env)
+	if len(envs) < 2 {
+		return nil
+	}
+	keysByAppEnv := map[string]map[string]map[string]bool{}
+	for _, env := range envs {
+		resolved, err := doc.ResolvedEnv(env)
+		if err != nil {
+			continue
+		}
+		for _, app := range targetApps(resolved, opt.App) {
+			if keysByAppEnv[app] == nil {
+				keysByAppEnv[app] = map[string]map[string]bool{}
+			}
+			keys := map[string]bool{}
+			for _, key := range appKeys(resolved, app) {
+				keys[key] = true
+			}
+			keysByAppEnv[app][env] = keys
+		}
+	}
+
+	var out []Diagnostic
+	for app, byEnv := range keysByAppEnv {
+		all := map[string]bool{}
+		for _, keys := range byEnv {
+			for key := range keys {
+				all[key] = true
+			}
+		}
+		for key := range all {
+			for _, env := range envs {
+				keys := byEnv[env]
+				if keys == nil || !keys[key] {
+					out = append(out, Diagnostic{Category: "Values", Severity: "warn", Message: fmt.Sprintf("%s/%s is missing %s, which exists in another env for app %s", env, app, key, app), Fix: fmt.Sprintf("add %s to %s/%s or confirm the env-specific difference", key, env, app)})
+				}
+			}
+		}
+	}
+	return out
+}
+
+func decryptSkippedDiagnostics(doc *config.Document, opt Options) []Diagnostic {
+	if !hasDecryptTargets(doc, opt) {
+		return nil
+	}
+	current, identities := currentIdentities(opt.User)
+	if current == "" {
+		return []Diagnostic{{Category: "Runtime", Severity: "info", Message: "decrypt-dependent checks were skipped because no current user is configured", Fix: "pass --user <username> or set CIN_USER"}}
+	}
+	if len(identities) == 0 {
+		return []Diagnostic{{Category: "Runtime", Severity: "info", Message: fmt.Sprintf("decrypt-dependent checks were skipped because no identity was found for %s", current), Fix: "install the matching age identity or set CIN_AGE_KEY"}}
+	}
+	return nil
+}
+
+func hasDecryptTargets(doc *config.Document, opt Options) bool {
+	for _, ref := range doc.ValueRefs() {
+		if matches(opt, ref.Env, ref.App) {
+			return true
+		}
+	}
+	return false
+}
+
 func runtimeDiagnostics(doc, localDoc *config.Document, schemas *cinschema.Set, opt Options) []Diagnostic {
 	var out []Diagnostic
 	if opt.Env != "" && !doc.HasEnv(opt.Env) {
@@ -268,7 +347,7 @@ func runtimeDiagnostics(doc, localDoc *config.Document, schemas *cinschema.Set, 
 			}
 			for _, key := range result.AppKeys() {
 				if err := result.Resolve(resolve.CanonicalPath(app, key)); err != nil {
-					out = append(out, Diagnostic{Category: "Templates", Severity: "error", Message: fmt.Sprintf("%s/%s/%s: %v", env, app, key, err), Fix: "fix the template reference or value"})
+					out = append(out, templateDiagnostic(env, app, key, resolved, err))
 				}
 			}
 			for _, err := range cinschema.ValidateResult(schemas, env, app, result) {
@@ -277,6 +356,28 @@ func runtimeDiagnostics(doc, localDoc *config.Document, schemas *cinschema.Set, 
 		}
 	}
 	return out
+}
+
+func templateDiagnostic(env, app, key string, resolved *yaml.Node, err error) Diagnostic {
+	where := fmt.Sprintf("%s/%s/%s", env, app, key)
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "missing template reference: apps."):
+		ref := strings.TrimPrefix(after(msg, "missing template reference: "), "apps.")
+		parts := strings.Split(ref, ".")
+		if len(parts) >= 3 && parts[1] == "values" && len(appKeys(resolved, parts[0])) == 0 {
+			return Diagnostic{Category: "Templates", Severity: "error", Message: fmt.Sprintf("%s references unknown app %s", where, parts[0]), Fix: "add the app values or fix the template reference"}
+		}
+		return Diagnostic{Category: "Templates", Severity: "error", Message: fmt.Sprintf("%s is missing template reference %s", where, after(msg, "missing template reference: ")), Fix: "set the referenced value or fix the template reference"}
+	case strings.Contains(msg, "missing template reference:"):
+		return Diagnostic{Category: "Templates", Severity: "error", Message: fmt.Sprintf("%s is missing template reference %s", where, after(msg, "missing template reference: ")), Fix: "set the referenced value or fix the template reference"}
+	case strings.Contains(msg, "template cycle detected"):
+		return Diagnostic{Category: "Templates", Severity: "error", Message: fmt.Sprintf("%s has a template cycle", where), Fix: "break the cycle between template references"}
+	case strings.Contains(msg, "uses unsupported template syntax"):
+		return Diagnostic{Category: "Templates", Severity: "error", Message: fmt.Sprintf("%s uses unsupported template syntax", where), Fix: "use only {{ .options.x }}, {{ .values.X }}, or {{ .apps.app.values.X }} lookups"}
+	default:
+		return Diagnostic{Category: "Templates", Severity: "error", Message: fmt.Sprintf("%s: %v", where, err), Fix: "fix the template reference or value"}
+	}
 }
 
 func resolvedEnv(doc, localDoc *config.Document, env string) (*yaml.Node, error) {
@@ -309,6 +410,12 @@ func print(stdout io.Writer, diags []Diagnostic) {
 		if len(items) == 0 {
 			continue
 		}
+		sort.SliceStable(items, func(i, j int) bool {
+			if severityRank(items[i].Severity) != severityRank(items[j].Severity) {
+				return severityRank(items[i].Severity) < severityRank(items[j].Severity)
+			}
+			return items[i].Message < items[j].Message
+		})
 		fmt.Fprintln(stdout, category)
 		for _, item := range items {
 			fmt.Fprintf(stdout, "  %s %s\n", item.Severity, item.Message)
@@ -436,6 +543,44 @@ func hasSeverity(diags []Diagnostic, severity string) bool {
 		}
 	}
 	return false
+}
+
+func severityRank(severity string) int {
+	switch severity {
+	case "error":
+		return 0
+	case "warn":
+		return 1
+	case "info":
+		return 2
+	default:
+		return 3
+	}
+}
+
+func valueCountForSets(doc *config.Document, sets []string) int {
+	if len(sets) == 0 {
+		return 0
+	}
+	inSet := map[string]bool{}
+	for _, set := range sets {
+		inSet[set] = true
+	}
+	count := 0
+	for _, ref := range doc.EncryptedValues() {
+		if inSet[ref.Value.RecipientSet] {
+			count++
+		}
+	}
+	return count
+}
+
+func after(text, marker string) string {
+	i := strings.Index(text, marker)
+	if i < 0 {
+		return text
+	}
+	return text[i+len(marker):]
 }
 
 func lookup(cur *yaml.Node, path []string) *yaml.Node {

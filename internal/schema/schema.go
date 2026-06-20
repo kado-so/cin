@@ -2,6 +2,7 @@ package schema
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -153,9 +154,36 @@ func validateInstance(appSchema AppSchema, env string, values map[string]any) []
 		return []ValidationError{{Path: appSchema.Path, Err: err}}
 	}
 	if err := compiled.Validate(values); err != nil {
-		return []ValidationError{{Path: appSchema.Path, Err: err}}
+		return validationErrors(appSchema.Path, err)
 	}
 	return nil
+}
+
+func validationErrors(path string, err error) []ValidationError {
+	var schemaErr *jsonschema.ValidationError
+	if !errors.As(err, &schemaErr) {
+		return []ValidationError{{Path: path, Err: err}}
+	}
+	var leaves []*jsonschema.ValidationError
+	collectValidationLeaves(&leaves, schemaErr)
+	out := make([]ValidationError, 0, len(leaves))
+	for _, leaf := range leaves {
+		out = append(out, ValidationError{Path: path, Err: leaf})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Err.Error() < out[j].Err.Error()
+	})
+	return out
+}
+
+func collectValidationLeaves(out *[]*jsonschema.ValidationError, err *jsonschema.ValidationError) {
+	if len(err.Causes) == 0 {
+		*out = append(*out, err)
+		return
+	}
+	for _, cause := range err.Causes {
+		collectValidationLeaves(out, cause)
+	}
 }
 
 func (s AppSchema) compile(env string) (*jsonschema.Schema, error) {

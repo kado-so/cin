@@ -424,6 +424,19 @@ func (d *Document) HasPath(path []string) bool {
 	return d.lookup(path) != nil
 }
 
+func (d *Document) TopLevelKeys() []string {
+	root := d.root.Content[0]
+	if root == nil || root.Kind != yaml.MappingNode {
+		return nil
+	}
+	keys := make([]string, 0, len(root.Content)/2)
+	for i := 0; i < len(root.Content); i += 2 {
+		keys = append(keys, root.Content[i].Value)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 func OptionPath(key string) ([]string, bool) {
 	if !strings.HasPrefix(key, "options.") {
 		return nil, false

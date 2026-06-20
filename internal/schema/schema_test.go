@@ -99,10 +99,14 @@ func TestValidateValuesUsesJSONSchemaAndEnvRequirements(t *testing.T) {
 	if len(errs) == 0 {
 		t.Fatal("expected type and additional property errors")
 	}
-	got := errs[0].Err.Error()
+	var got strings.Builder
+	for _, err := range errs {
+		got.WriteString(err.Err.Error())
+		got.WriteByte('\n')
+	}
 	for _, want := range []string{"PORT", "EXTRA"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("expected validation error to mention %s, got %q", want, got)
+		if !strings.Contains(got.String(), want) {
+			t.Fatalf("expected validation errors to mention %s, got %q", want, got.String())
 		}
 	}
 }
