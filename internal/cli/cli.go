@@ -18,7 +18,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"text/tabwriter"
 
 	"cin/internal/config"
@@ -1724,13 +1723,13 @@ func signalCleanup(path string) func() {
 	done := make(chan struct{})
 	signals := make(chan os.Signal, 1)
 	var once sync.Once
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(signals, handledSignals()...)
 	go func() {
 		select {
 		case sig := <-signals:
 			_ = os.RemoveAll(path)
 			signal.Stop(signals)
-			_ = syscall.Kill(syscall.Getpid(), sig.(syscall.Signal))
+			signalSelf(sig)
 		case <-done:
 		}
 	}()
@@ -1756,13 +1755,13 @@ func runChild(args []string, envVars map[string]string, stdin io.Reader, stdout 
 
 	done := make(chan struct{})
 	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	signal.Notify(signals, handledSignals()...)
 	defer signal.Stop(signals)
 	go func() {
 		for {
 			select {
 			case sig := <-signals:
-				_ = cmd.Process.Signal(sig)
+				_ = signalProcess(cmd.Process, sig)
 			case <-done:
 				return
 			}
@@ -1804,13 +1803,6 @@ func childEnv(envVars map[string]string) []string {
 		env = append(env, key+"="+envVars[key])
 	}
 	return env
-}
-
-func processExitCode(err *exec.ExitError) int {
-	if status, ok := err.ProcessState.Sys().(syscall.WaitStatus); ok && status.Signaled() {
-		return 128 + int(status.Signal())
-	}
-	return err.ExitCode()
 }
 
 func resolvedEnv(doc *config.Document, localFile string, noLocal bool, env string) (*yaml.Node, error) {

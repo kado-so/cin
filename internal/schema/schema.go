@@ -66,7 +66,7 @@ func Discover(doc *config.Document, configPath string) (*Set, error) {
 		for _, match := range matches {
 			s, err := Load(match)
 			if err != nil {
-				out.LoadErrors = append(out.LoadErrors, LoadError{Path: match, Err: err})
+				out.LoadErrors = append(out.LoadErrors, LoadError{Path: filepath.ToSlash(match), Err: err})
 				continue
 			}
 			out.Schemas = append(out.Schemas, s)
@@ -76,18 +76,19 @@ func Discover(doc *config.Document, configPath string) (*Set, error) {
 }
 
 func Load(path string) (AppSchema, error) {
+	displayPath := filepath.ToSlash(path)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return AppSchema{}, err
 	}
 	var s AppSchema
 	if err := yaml.Unmarshal(data, &s); err != nil {
-		return AppSchema{}, fmt.Errorf("invalid schema file %s: %w", path, err)
+		return AppSchema{}, fmt.Errorf("invalid schema file %s: %w", displayPath, err)
 	}
 	if s.App == "" {
-		return AppSchema{}, fmt.Errorf("invalid schema file %s: app is required", path)
+		return AppSchema{}, fmt.Errorf("invalid schema file %s: app is required", displayPath)
 	}
-	s.Path = path
+	s.Path = displayPath
 	s.Values = normalizeMap(s.Values)
 	for env, envSchema := range s.Envs {
 		envSchema.Values = normalizeMap(envSchema.Values)

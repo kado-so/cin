@@ -2,8 +2,11 @@ package behavior
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -162,4 +165,83 @@ func (s *Story) AssertNoPlaintext(haystack string, values ...string) {
 
 func (r Result) Combined() string {
 	return r.Stdout + r.Stderr
+}
+
+func storyHelperCommand(t *testing.T, name string, args ...string) []string {
+	t.Helper()
+	t.Setenv("CIN_HELPER_PROCESS", "1")
+	return append([]string{os.Args[0], "-test.run=TestHelperProcess", "--", name}, args...)
+}
+
+func storyHelperCommandString(t *testing.T, name string, args ...string) string {
+	t.Helper()
+	return strings.Join(storyHelperCommand(t, name, args...), " ")
+}
+
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("CIN_HELPER_PROCESS") != "1" {
+		return
+	}
+	args := os.Args
+	for len(args) > 0 && args[0] != "--" {
+		args = args[1:]
+	}
+	if len(args) < 2 {
+		os.Exit(2)
+	}
+	switch args[1] {
+	case "printenvlines":
+		for _, key := range args[2:] {
+			fmt.Fprintln(os.Stdout, os.Getenv(key))
+		}
+	case "editor":
+		os.Exit(runStoryFakeEditor(args[2], args[3]))
+	default:
+		code, _ := strconv.Atoi(args[1])
+		os.Exit(code)
+	}
+	os.Exit(0)
+}
+
+func runStoryFakeEditor(scriptPath, target string) int {
+	scriptData, err := os.ReadFile(scriptPath)
+	if err != nil {
+		return 2
+	}
+	script := string(scriptData)
+	data, err := os.ReadFile(target)
+	if err != nil {
+		return 2
+	}
+	text := string(data)
+	for _, match := range regexp.MustCompile(`(?m)grep -q '([^']+)' "\$1" \|\| exit 1`).FindAllStringSubmatch(script, -1) {
+		if !storyGrepMatch(match[1], text) {
+			return 1
+		}
+	}
+	for _, match := range regexp.MustCompile(`(?s)cat > "\$1" <<'EOF'\r?\n(.*?)\r?\nEOF`).FindAllStringSubmatch(script, -1) {
+		return writeStoryFakeEditTarget(target, match[1])
+	}
+	if match := regexp.MustCompile(`sed '([^']+)' "\$1"`).FindStringSubmatch(script); len(match) == 2 {
+		for _, edit := range strings.Split(match[1], ";") {
+			parts := strings.Split(strings.TrimSuffix(strings.TrimSpace(edit), "/g"), "/")
+			if len(parts) == 3 && parts[0] == "s" {
+				text = strings.ReplaceAll(text, parts[1], parts[2])
+			}
+		}
+		return writeStoryFakeEditTarget(target, text)
+	}
+	return 0
+}
+
+func storyGrepMatch(pattern, text string) bool {
+	ok, err := regexp.MatchString("(?m)"+pattern, text)
+	return err == nil && ok
+}
+
+func writeStoryFakeEditTarget(path, data string) int {
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		return 2
+	}
+	return 0
 }

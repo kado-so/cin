@@ -153,11 +153,11 @@ EOF
 
 func storyFakeEditor(t *testing.T, script string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "editor.sh")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script+"\n"), 0o700); err != nil {
+	path := filepath.Join(t.TempDir(), "editor-script")
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
 		t.Fatalf("write fake editor: %v", err)
 	}
-	return path
+	return storyHelperCommandString(t, "editor", path)
 }
 
 func setStoryDefaultEnv(t *testing.T, path string, env string) {

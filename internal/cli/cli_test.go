@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -854,7 +857,7 @@ func TestRunInjectsSelectedAppValues(t *testing.T) {
 	runOK(t, []string{"-f", path, "init", "vaishnav"})
 	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "from-cin"})
 
-	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "run", "-e", "dev", "-a", "api", "--", "/bin/sh", "-c", "printf %s \"$API_TOKEN\""})
+	stdout, stderr, code := runCLI(append([]string{"-f", path, "--user", "vaishnav", "run", "-e", "dev", "-a", "api", "--"}, helperCommand(t, "printenv", "API_TOKEN")...))
 	if code != 0 {
 		t.Fatalf("run failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
@@ -864,7 +867,7 @@ func TestRunInjectsSelectedAppValues(t *testing.T) {
 }
 
 func TestRunRequiresApp(t *testing.T) {
-	stdout, stderr, code := runCLI([]string{"run", "-e", "dev", "--", "/usr/bin/true"})
+	stdout, stderr, code := runCLI(append([]string{"run", "-e", "dev", "--"}, helperCommand(t, "true")...))
 	if code != 2 {
 		t.Fatalf("expected missing app failure, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
@@ -881,7 +884,7 @@ func TestRunPreservesChildExitCode(t *testing.T) {
 	runOK(t, []string{"-f", path, "init", "vaishnav"})
 	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "API_TOKEN", "from-cin"})
 
-	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "run", "-e", "dev", "-a", "api", "--", "/bin/sh", "-c", "exit 7"})
+	stdout, stderr, code := runCLI(append([]string{"-f", path, "--user", "vaishnav", "run", "-e", "dev", "-a", "api", "--"}, helperCommand(t, "exit", "7")...))
 	if code != 7 {
 		t.Fatalf("expected child exit code 7, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
@@ -902,7 +905,7 @@ func TestRunAppliesLocalOverrideAndTemplateResolution(t *testing.T) {
 	runOK(t, []string{"-f", "configs.local.secret.yaml", "init", "local"})
 	runOK(t, []string{"-f", "configs.local.secret.yaml", "set", "-e", "dev", "options.postgres.host", "local"})
 
-	stdout, stderr, code := runCLI([]string{"--user", "vaishnav", "run", "-e", "dev", "-a", "api", "--", "/bin/sh", "-c", "printf %s \"$DATABASE_URL\""})
+	stdout, stderr, code := runCLI(append([]string{"--user", "vaishnav", "run", "-e", "dev", "-a", "api", "--"}, helperCommand(t, "printenv", "DATABASE_URL")...))
 	if code != 0 {
 		t.Fatalf("run failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
@@ -919,7 +922,7 @@ func TestRunDoesNotPrintPlaintextFromCin(t *testing.T) {
 	runOK(t, []string{"-f", path, "init", "vaishnav"})
 	runOK(t, []string{"-f", path, "set", "-e", "dev", "-a", "api", "SECRET_TOKEN", "do-not-print"})
 
-	stdout, stderr, code := runCLI([]string{"-f", path, "--user", "vaishnav", "run", "-e", "dev", "-a", "api", "--", "/usr/bin/true"})
+	stdout, stderr, code := runCLI(append([]string{"-f", path, "--user", "vaishnav", "run", "-e", "dev", "-a", "api", "--"}, helperCommand(t, "true")...))
 	if code != 0 {
 		t.Fatalf("run failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
@@ -952,7 +955,7 @@ values:
 	setConfigSchemas(t, "configs.secret.yaml", "apps/*/cin.schema.yaml")
 	runOK(t, []string{"set", "-e", "dev", "-a", "api", "PORT", "not-a-number"})
 
-	stdout, stderr, code := runCLI([]string{"--user", "vaishnav", "run", "-e", "dev", "-a", "api", "--", "/bin/sh", "-c", "printf ran"})
+	stdout, stderr, code := runCLI(append([]string{"--user", "vaishnav", "run", "-e", "dev", "-a", "api", "--"}, helperCommand(t, "print", "ran")...))
 	if code != 2 {
 		t.Fatalf("expected schema failure, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
@@ -997,7 +1000,7 @@ envs:
 	setConfigSchemas(t, "configs.secret.yaml", "apps/*/cin.schema.yaml")
 	runOK(t, []string{"set", "-e", "prod", "-a", "api", "SENTRY_DSN", "https://sentry.example"})
 
-	stdout, stderr, code := runCLI([]string{"--user", "vaishnav", "run", "-e", "prod", "-a", "api", "--", "/bin/sh", "-c", "printf ran"})
+	stdout, stderr, code := runCLI(append([]string{"--user", "vaishnav", "run", "-e", "prod", "-a", "api", "--"}, helperCommand(t, "print", "ran")...))
 	if code != 2 {
 		t.Fatalf("expected missing base-required schema failure, got code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
@@ -1258,6 +1261,9 @@ func TestExportFileUsesRestrictivePermissions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat export: %v", err)
 	}
+	if runtime.GOOS == "windows" {
+		return
+	}
 	if mode := info.Mode().Perm(); mode != 0o600 {
 		t.Fatalf("expected 0600 file mode, got %03o", mode)
 	}
@@ -1318,15 +1324,17 @@ func TestSecureTempFileUsesRestrictivePermissionsAndCleansUp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat temp dir: %v", err)
 	}
-	if mode := dirInfo.Mode().Perm(); mode != 0o700 {
-		t.Fatalf("expected temp dir 0700, got %03o", mode)
-	}
 	fileInfo, err := os.Stat(path)
 	if err != nil {
 		t.Fatalf("stat temp file: %v", err)
 	}
-	if mode := fileInfo.Mode().Perm(); mode != 0o600 {
-		t.Fatalf("expected temp file 0600, got %03o", mode)
+	if runtime.GOOS != "windows" {
+		if mode := dirInfo.Mode().Perm(); mode != 0o700 {
+			t.Fatalf("expected temp dir 0700, got %03o", mode)
+		}
+		if mode := fileInfo.Mode().Perm(); mode != 0o600 {
+			t.Fatalf("expected temp file 0600, got %03o", mode)
+		}
 	}
 
 	cleanup()
@@ -2312,20 +2320,161 @@ func dotenvKeys(data string) []string {
 
 func fakeEditor(t *testing.T, script string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "editor.sh")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script+"\n"), 0o700); err != nil {
+	path := filepath.Join(t.TempDir(), "editor-script")
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
 		t.Fatalf("write fake editor: %v", err)
 	}
-	return path
+	return helperCommandString(t, "editor", path)
 }
 
 func fakePager(t *testing.T, script string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "pager.sh")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script+"\n"), 0o700); err != nil {
+	path := filepath.Join(t.TempDir(), "pager-script")
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
 		t.Fatalf("write fake pager: %v", err)
 	}
-	return path
+	return helperCommandString(t, "pager")
+}
+
+func helperCommand(t *testing.T, name string, args ...string) []string {
+	t.Helper()
+	t.Setenv("CIN_HELPER_PROCESS", "1")
+	return append([]string{os.Args[0], "-test.run=TestHelperProcess", "--", name}, args...)
+}
+
+func helperCommandString(t *testing.T, name string, args ...string) string {
+	t.Helper()
+	return strings.Join(helperCommand(t, name, args...), " ")
+}
+
+func TestHelperProcess(t *testing.T) {
+	if os.Getenv("CIN_HELPER_PROCESS") != "1" {
+		return
+	}
+	args := os.Args
+	for len(args) > 0 && args[0] != "--" {
+		args = args[1:]
+	}
+	if len(args) < 2 {
+		os.Exit(2)
+	}
+	switch args[1] {
+	case "true":
+		os.Exit(0)
+	case "exit":
+		code, _ := strconv.Atoi(args[2])
+		os.Exit(code)
+	case "print":
+		fmt.Fprint(os.Stdout, strings.Join(args[2:], " "))
+	case "printenv":
+		fmt.Fprint(os.Stdout, os.Getenv(args[2]))
+	case "editor":
+		os.Exit(runFakeEditor(args[2], args[3]))
+	case "pager":
+		os.Exit(runFakePager(args[2]))
+	default:
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
+func runFakePager(path string) int {
+	data, err := os.ReadFile(path)
+	if err != nil || !strings.Contains(string(data), "API_TOKEN=token\n") {
+		return 9
+	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		if err != nil || info.Mode().Perm() != 0o600 {
+			return 7
+		}
+		dirInfo, err := os.Stat(filepath.Dir(path))
+		if err != nil || dirInfo.Mode().Perm() != 0o700 {
+			return 8
+		}
+	}
+	if record := os.Getenv("PAGER_RECORD"); record != "" {
+		if err := os.WriteFile(record, []byte(path), 0o600); err != nil {
+			return 10
+		}
+	}
+	fmt.Fprintln(os.Stdout, "paged")
+	return 0
+}
+
+func runFakeEditor(scriptPath, target string) int {
+	scriptData, err := os.ReadFile(scriptPath)
+	if err != nil {
+		return 2
+	}
+	script := string(scriptData)
+	data, err := os.ReadFile(target)
+	if err != nil {
+		return 2
+	}
+	text := string(data)
+	for _, match := range regexp.MustCompile(`(?m)grep -q '([^']+)' "\$1" \|\| exit 1`).FindAllStringSubmatch(script, -1) {
+		if !grepMatch(match[1], text) {
+			return 1
+		}
+	}
+	for _, match := range regexp.MustCompile(`(?m)grep -q '([^']+)' "\$1" && exit 1`).FindAllStringSubmatch(script, -1) {
+		if grepMatch(match[1], text) {
+			return 1
+		}
+	}
+	if match := regexp.MustCompile(`(?s)cat > "\$1" <<'EOF'\r?\n(.*?)\r?\nEOF`).FindStringSubmatch(script); len(match) == 2 {
+		code := writeFakeEditTarget(target, match[1])
+		if code != 0 || exitsOne(script) {
+			return max(code, 1)
+		}
+		return 0
+	}
+	if match := regexp.MustCompile(`printf '([^']*)' > "\$1"`).FindStringSubmatch(script); len(match) == 2 {
+		return writeFakeEditTarget(target, match[1])
+	}
+	if match := regexp.MustCompile(`sed '([^']+)' "\$1"`).FindStringSubmatch(script); len(match) == 2 {
+		for _, edit := range strings.Split(match[1], ";") {
+			parts := strings.Split(strings.TrimSuffix(strings.TrimSpace(edit), "/g"), "/")
+			if len(parts) == 3 && parts[0] == "s" {
+				text = strings.ReplaceAll(text, parts[1], parts[2])
+			}
+		}
+		return writeFakeEditTarget(target, text)
+	}
+	if strings.Contains(script, `if ($0 == "envs:")`) {
+		var out []string
+		for _, line := range strings.Split(text, "\n") {
+			out = append(out, line)
+			if line == "envs:" {
+				out = append(out,
+					"  staging:",
+					"    apps:",
+					"      api:",
+					"        values:",
+					"          API_TOKEN: staging-token",
+				)
+			}
+		}
+		return writeFakeEditTarget(target, strings.Join(out, "\n"))
+	}
+	return 0
+}
+
+func grepMatch(pattern, text string) bool {
+	ok, err := regexp.MatchString("(?m)"+pattern, text)
+	return err == nil && ok
+}
+
+func writeFakeEditTarget(path, data string) int {
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		return 2
+	}
+	return 0
+}
+
+func exitsOne(script string) bool {
+	return regexp.MustCompile(`(?m)^exit 1$`).MatchString(script)
 }
 
 func setExtends(t *testing.T, path string, env string, parent string) {

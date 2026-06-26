@@ -70,7 +70,7 @@ func TestLocalDeveloperStory(t *testing.T) {
 		}
 	}
 
-	run := story.OK(story.RunAs("vaishnav", "run", "-e", "dev", "-a", "api", "--", "/bin/sh", "-c", "printf '%s\n%s\n' \"$DATABASE_URL\" \"$REDIS_URL\""))
+	run := story.OK(story.RunAs("vaishnav", append([]string{"run", "-e", "dev", "-a", "api", "--"}, storyHelperCommand(t, "printenvlines", "DATABASE_URL", "REDIS_URL")...)...))
 	if got := strings.TrimSpace(run.Stdout); got != databaseURL+"\n"+localRedis {
 		t.Fatalf("expected run to inject local overrides, got %q", got)
 	}
