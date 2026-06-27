@@ -26,6 +26,13 @@ jobs:
 
       - uses: sigstore/cosign-installer@v3
 
+      - name: Prepare Apple notary key
+        run: |
+          echo -n "$MACOS_NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/notary-key.p8"
+          echo "MACOS_NOTARY_KEY_PATH=$RUNNER_TEMP/notary-key.p8" >> "$GITHUB_ENV"
+        env:
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+
       - uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
@@ -38,4 +45,3 @@ jobs:
           MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
           MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
           MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
