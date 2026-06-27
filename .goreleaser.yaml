@@ -1,0 +1,42 @@
+version: 2
+
+project_name: cin
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: cin
+    main: ./cmd/cin
+    binary: cin
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X cin/internal/cli.version={{ .Version }}
+
+archives:
+  - id: cin
+    ids:
+      - cin
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
+  sort: asc
