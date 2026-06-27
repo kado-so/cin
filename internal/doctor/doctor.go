@@ -7,11 +7,11 @@ import (
 	"sort"
 	"strings"
 
-	"cin/internal/config"
-	"cin/internal/cryptoage"
-	"cin/internal/envelope"
-	"cin/internal/resolve"
-	cinschema "cin/internal/schema"
+	"github.com/kado-so/cin/internal/config"
+	"github.com/kado-so/cin/internal/cryptoage"
+	"github.com/kado-so/cin/internal/envelope"
+	"github.com/kado-so/cin/internal/resolve"
+	cinschema "github.com/kado-so/cin/internal/schema"
 	"filippo.io/age"
 	"gopkg.in/yaml.v3"
 )

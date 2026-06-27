@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"cin/internal/cli"
-	"cin/internal/config"
+	"github.com/kado-so/cin/internal/cli"
+	"github.com/kado-so/cin/internal/config"
 	"filippo.io/age"
 )
 

@@ -9,7 +9,7 @@ is not printed unless a command explicitly asks for it.
 ## Install
 
 ```bash
-go build -o cin ./cmd/cin
+go install github.com/kado-so/cin/cmd/cin@latest
 ```
 
 Put the binary on your `PATH`.

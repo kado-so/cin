@@ -10,7 +10,7 @@ import (
 	"os"
 	"testing"
 
-	"cin/internal/envelope"
+	"github.com/kado-so/cin/internal/envelope"
 )
 
 func TestGetValueStory(t *testing.T) {

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"cin/internal/config"
+	"github.com/kado-so/cin/internal/config"
 )
 
 func TestDiscoverReportsMissingGlobAndLoadsAppSchema(t *testing.T) {

@@ -1,0 +1,129 @@
+:root {
+  --sl-color-accent-low: #dbeafe;
+  --sl-color-accent: #2563eb;
+  --sl-color-accent-high: #172554;
+}
+
+:root[data-theme='dark'] {
+  --sl-color-accent-low: #172554;
+  --sl-color-accent: #60a5fa;
+  --sl-color-accent-high: #dbeafe;
+}
+
+.sl-markdown-content .badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 1rem 0 1.5rem;
+}
+
+.sl-markdown-content .badges a {
+  text-decoration: none;
+}
+
+.sl-markdown-content .install-switcher {
+  max-width: 56rem;
+  margin-block: 1rem 2rem;
+}
+
+.sl-markdown-content .install-tablist {
+  align-items: center;
+  background: var(--sl-color-gray-6);
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.65rem;
+  display: inline-flex;
+  gap: 0.15rem;
+  margin-bottom: 0.75rem;
+  padding: 0.2rem;
+}
+
+.sl-markdown-content .install-tab {
+  all: unset;
+  border-radius: 0.48rem;
+  box-sizing: border-box;
+  color: var(--sl-color-gray-2);
+  cursor: pointer;
+  font-size: 0.84rem;
+  font-weight: 650;
+  line-height: 1.1;
+  padding: 0.46rem 0.72rem;
+  transition:
+    background-color 120ms ease,
+    color 120ms ease,
+    box-shadow 120ms ease;
+}
+
+.sl-markdown-content .install-tab:focus-visible {
+  outline: 2px solid var(--sl-color-accent);
+  outline-offset: 2px;
+}
+
+.sl-markdown-content .install-tab[aria-selected='true'] {
+  background: var(--sl-color-bg);
+  box-shadow: 0 1px 2px rgb(15 23 42 / 12%);
+  color: var(--sl-color-white);
+}
+
+.sl-markdown-content .install-card {
+  background: #0f172a;
+  border: 1px solid #1e293b;
+  border-radius: 0.7rem;
+  box-shadow: 0 14px 34px rgb(15 23 42 / 12%);
+  overflow: hidden;
+}
+
+.sl-markdown-content .install-code-head {
+  align-items: center;
+  background: #111827;
+  border-bottom: 1px solid #253247;
+  color: #cbd5e1;
+  display: flex;
+  font-size: 0.78rem;
+  font-weight: 650;
+  justify-content: space-between;
+  letter-spacing: 0;
+  padding: 0.52rem 0.65rem 0.52rem 0.85rem;
+}
+
+.sl-markdown-content .install-copy {
+  all: unset;
+  background: #1e293b;
+  border: 1px solid #334155;
+  border-radius: 0.42rem;
+  box-sizing: border-box;
+  color: #e2e8f0;
+  cursor: pointer;
+  font-size: 0.74rem;
+  font-weight: 650;
+  line-height: 1;
+  padding: 0.34rem 0.55rem;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
+}
+
+.sl-markdown-content .install-copy:hover {
+  background: #2563eb;
+  border-color: #3b82f6;
+  color: white;
+}
+
+.sl-markdown-content .install-copy:focus-visible {
+  outline: 2px solid #93c5fd;
+  outline-offset: 2px;
+}
+
+.sl-markdown-content .install-panel pre {
+  background: transparent;
+  border: 0;
+  color: #e5e7eb;
+  margin: 0;
+  padding: 0.95rem 1rem 1rem;
+}
+
+.sl-markdown-content .install-panel code {
+  color: inherit;
+  font-size: 0.9rem;
+  line-height: 1.7;
+}

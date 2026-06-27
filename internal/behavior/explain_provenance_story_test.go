@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"cin/internal/envelope"
+	"github.com/kado-so/cin/internal/envelope"
 )
 
 func TestExplainProvenanceStory(t *testing.T) {

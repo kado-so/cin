@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"cin/internal/config"
+	"github.com/kado-so/cin/internal/config"
 	"gopkg.in/yaml.v3"
 )
 

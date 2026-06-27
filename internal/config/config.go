@@ -8,7 +8,7 @@ import (
 	"sort"
 	"strings"
 
-	"cin/internal/envelope"
+	"github.com/kado-so/cin/internal/envelope"
 	"gopkg.in/yaml.v3"
 )
 

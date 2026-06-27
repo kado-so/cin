@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"cin/internal/config"
-	"cin/internal/envelope"
+	"github.com/kado-so/cin/internal/config"
+	"github.com/kado-so/cin/internal/envelope"
 )
 
 func TestSharedDevTemplatesStory(t *testing.T) {

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"cin/internal/config"
+	"github.com/kado-so/cin/internal/config"
 )
 
 func TestCIApprovalStory(t *testing.T) {

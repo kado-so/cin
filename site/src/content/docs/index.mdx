@@ -1,0 +1,42 @@
+---
+title: cin
+description: Encrypted config in Git, injected at runtime.
+---
+
+import InstallTabs from '../../components/InstallTabs.astro';
+
+<div class="badges">
+  <a href="https://github.com/kado-so/cin/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/kado-so/cin?style=social" /></a>
+  <a href="https://github.com/kado-so/cin/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/kado-so/cin?include_prereleases" /></a>
+  <a href="https://github.com/kado-so/cin/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/kado-so/cin" /></a>
+</div>
+
+`cin` means config inject. It is a small CLI for encrypted app config in Git.
+
+```bash
+# create the shared encrypted config file
+cin init vaishnav
+
+# set encrypted environment options
+cin set -e dev options.postgres.host postgres
+cin set -e dev options.postgres.port 5432
+
+# compose app env with encrypted templates
+cin set -e dev -a api DATABASE_URL \
+  'postgres://{{ .options.postgres.host }}:{{ .options.postgres.port }}/api'
+
+# inject resolved values at runtime
+cin run -e dev -a api -- pnpm dev
+```
+
+## Install
+
+<InstallTabs />
+
+## Why it exists
+
+- No backend service, daemon, hosted vault, or control plane.
+- Secrets stay encrypted in `configs.secret.yaml`.
+- Runtime commands receive resolved environment variables.
+- Plaintext is never printed unless a command explicitly asks for it.
+- CI/CD is modeled as a normal encrypted recipient.

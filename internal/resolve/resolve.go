@@ -8,8 +8,8 @@ import (
 	"strings"
 	"text/template/parse"
 
-	"cin/internal/cryptoage"
-	"cin/internal/envelope"
+	"github.com/kado-so/cin/internal/cryptoage"
+	"github.com/kado-so/cin/internal/envelope"
 	"filippo.io/age"
 	"gopkg.in/yaml.v3"
 )

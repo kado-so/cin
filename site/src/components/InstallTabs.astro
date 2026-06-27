@@ -1,0 +1,112 @@
+---
+const options = [
+  {
+    id: 'brew',
+    label: 'Homebrew',
+    value: 'brew install kado-so/tap/cin',
+  },
+  {
+    id: 'go',
+    label: 'Go',
+    value: 'go install github.com/kado-so/cin/cmd/cin@latest',
+  },
+  {
+    id: 'source',
+    label: 'Source',
+    value: 'git clone https://github.com/kado-so/cin\ncd cin\ngo test ./...\ngo build -o cin ./cmd/cin',
+  },
+  {
+    id: 'release',
+    label: 'Release',
+    value: 'https://github.com/kado-so/cin/releases',
+  },
+];
+---
+
+<div class="install-switcher" data-install-tabs>
+  <div class="install-tablist" role="tablist" aria-label="Install method">
+    {
+      options.map((option, index) => (
+        <button
+          aria-controls={`install-panel-${option.id}`}
+          aria-selected={index === 0 ? 'true' : 'false'}
+          class="install-tab"
+          data-install-tab={option.id}
+          id={`install-tab-${option.id}`}
+          role="tab"
+          type="button"
+        >
+          {option.label}
+        </button>
+      ))
+    }
+  </div>
+
+  <div class="install-card">
+    {
+      options.map((option, index) => (
+        <section
+          aria-labelledby={`install-tab-${option.id}`}
+          class="install-panel"
+          data-copy-value={option.value}
+          data-install-panel={option.id}
+          hidden={index !== 0}
+          id={`install-panel-${option.id}`}
+          role="tabpanel"
+        >
+          <div class="install-code-head">
+            <span>{option.label}</span>
+            <button class="install-copy" data-copy type="button">Copy</button>
+          </div>
+          <pre aria-label={`${option.label} install command`}><code>{option.value}</code></pre>
+        </section>
+      ))
+    }
+  </div>
+</div>
+
+<script>
+  for (const root of document.querySelectorAll('[data-install-tabs]')) {
+    const tabs = Array.from(root.querySelectorAll('[data-install-tab]'));
+    const panels = Array.from(root.querySelectorAll('[data-install-panel]'));
+
+    for (const tab of tabs) {
+      tab.addEventListener('click', () => {
+        const active = tab.getAttribute('data-install-tab');
+        for (const item of tabs) item.setAttribute('aria-selected', String(item === tab));
+        for (const panel of panels) panel.hidden = panel.getAttribute('data-install-panel') !== active;
+      });
+    }
+
+    for (const button of root.querySelectorAll('[data-copy]')) {
+      button.addEventListener('click', async () => {
+        const panel = button.closest('[data-copy-value]');
+        const value = panel?.getAttribute('data-copy-value') ?? '';
+        const fallbackCopy = () => {
+          const textarea = document.createElement('textarea');
+          textarea.value = value;
+          textarea.style.position = 'fixed';
+          textarea.style.opacity = '0';
+          document.body.append(textarea);
+          textarea.select();
+          document.execCommand('copy');
+          textarea.remove();
+        };
+
+        try {
+          if (navigator.clipboard) {
+            await navigator.clipboard.writeText(value);
+          } else {
+            fallbackCopy();
+          }
+        } catch {
+          fallbackCopy();
+        }
+        button.textContent = 'Copied';
+        window.setTimeout(() => {
+          button.textContent = 'Copy';
+        }, 1200);
+      });
+    }
+  }
+</script>

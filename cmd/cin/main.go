@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"cin/internal/cli"
+	"github.com/kado-so/cin/internal/cli"
 )
 
 func main() {

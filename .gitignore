@@ -3,9 +3,13 @@
 # Local encrypted overrides are machine-specific.
 configs.local.secret.yaml
 
+# Site dependencies and build outputs.
+node_modules/
+.astro/
+dist/
+
 # Build outputs.
 /bin/
-/dist/
 /cin
 
 # Test and coverage outputs.

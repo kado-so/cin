@@ -9,8 +9,8 @@ import (
 	"sort"
 	"strings"
 
-	"cin/internal/config"
-	"cin/internal/resolve"
+	"github.com/kado-so/cin/internal/config"
+	"github.com/kado-so/cin/internal/resolve"
 	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
 	"github.com/yargevad/filepathx"
 	"gopkg.in/yaml.v3"

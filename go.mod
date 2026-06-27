@@ -1,4 +1,4 @@
-module cin
+module github.com/kado-so/cin
 
 go 1.22
 
