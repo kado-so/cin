@@ -3,6 +3,7 @@ import starlight from '@astrojs/starlight';
 
 export default defineConfig({
   site: 'https://kado-so.github.io',
+  base: '/cin',
   integrations: [
     starlight({
       title: 'cin',
