@@ -72,8 +72,8 @@ notarize:
       notarize:
         issuer_id: "{{ .Env.MACOS_NOTARY_ISSUER_ID }}"
         key_id: "{{ .Env.MACOS_NOTARY_KEY_ID }}"
-        key: "{{ .Env.MACOS_NOTARY_KEY_PATH }}"
-        timeout: 60m
+        key: "{{ .Env.MACOS_NOTARY_KEY }}"
+        timeout: 20m
         wait: true
 
 changelog:
