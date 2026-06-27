@@ -37,6 +37,20 @@ archives:
 checksum:
   name_template: checksums.txt
 
+homebrew_casks:
+  - name: cin
+    ids:
+      - cin
+    repository:
+      owner: kado-so
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    binaries:
+      - cin
+    homepage: "https://github.com/kado-so/cin"
+    description: "Config management CLI for encrypted app config"
+    license: MIT
+
 signs:
   - cmd: cosign
     signature: "${artifact}.sigstore.json"
@@ -59,6 +73,7 @@ notarize:
         issuer_id: "{{ .Env.MACOS_NOTARY_ISSUER_ID }}"
         key_id: "{{ .Env.MACOS_NOTARY_KEY_ID }}"
         key: "{{ .Env.MACOS_NOTARY_KEY }}"
+        timeout: 60m
         wait: true
 
 changelog:
