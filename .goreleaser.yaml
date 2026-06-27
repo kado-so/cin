@@ -51,6 +51,51 @@ homebrew_casks:
     description: "Config management CLI for encrypted app config"
     license: MIT
 
+scoops:
+  - name: cin
+    ids:
+      - cin
+    repository:
+      owner: kado-so
+      name: scoop-bucket
+      token: "{{ .Env.SCOOP_BUCKET_GITHUB_TOKEN }}"
+    commit_msg_template: "Scoop update for cin {{ .Tag }}"
+    homepage: "https://github.com/kado-so/cin"
+    description: "Config management CLI for encrypted app config"
+    license: MIT
+
+winget:
+  - name: cin
+    publisher: Kado
+    short_description: "Config management CLI for encrypted app config"
+    license: MIT
+    publisher_url: "https://github.com/kado-so"
+    publisher_support_url: "https://github.com/kado-so/cin/issues/new"
+    package_identifier: Kado.Cin
+    package_name: cin
+    ids:
+      - cin
+    commit_msg_template: "Kado.Cin: {{ .Tag }}"
+    homepage: "https://github.com/kado-so/cin"
+    description: "Config management CLI for encrypted app config"
+    copyright: "Kado"
+    release_notes_url: "https://github.com/kado-so/cin/releases/tag/{{ .Tag }}"
+    tags:
+      - config
+      - secrets
+      - cli
+    repository:
+      owner: kado-so
+      name: winget-pkgs
+      branch: "cin-{{ .Version }}"
+      token: "{{ .Env.WINGET_GITHUB_TOKEN }}"
+      pull_request:
+        enabled: true
+        base:
+          owner: microsoft
+          name: winget-pkgs
+          branch: master
+
 signs:
   - cmd: cosign
     signature: "${artifact}.sigstore.json"

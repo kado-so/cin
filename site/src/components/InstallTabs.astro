@@ -3,7 +3,17 @@ const options = [
   {
     id: 'brew',
     label: 'Homebrew',
-    value: 'brew install kado-so/tap/cin',
+    value: 'brew install --cask kado-so/tap/cin',
+  },
+  {
+    id: 'scoop',
+    label: 'Scoop',
+    value: 'scoop bucket add kado https://github.com/kado-so/scoop-bucket\nscoop install kado/cin',
+  },
+  {
+    id: 'winget',
+    label: 'winget',
+    value: 'winget install Kado.Cin',
   },
   {
     id: 'go',

@@ -8,6 +8,22 @@ is not printed unless a command explicitly asks for it.
 
 ## Install
 
+macOS:
+
+```bash
+brew install --cask kado-so/tap/cin
+```
+
+Windows:
+
+```powershell
+scoop bucket add kado https://github.com/kado-so/scoop-bucket
+scoop install kado/cin
+winget install Kado.Cin
+```
+
+Any platform with Go:
+
 ```bash
 go install github.com/kado-so/cin/cmd/cin@latest
 ```
